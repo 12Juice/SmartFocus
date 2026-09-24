@@ -20,6 +20,12 @@ swiftc -O -whole-module-optimization \
 cp Info.plist "${APP_BUNDLE}/Contents/Info.plist"
 printf 'APPL????' > "${APP_BUNDLE}/Contents/PkgInfo"
 
+if [ -f assets/AppIcon.icns ]; then
+    cp assets/AppIcon.icns "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+else
+    echo "⚠️  assets/AppIcon.icns missing — regenerate via tools/generate_icon.swift + iconutil"
+fi
+
 # Ad-hoc signature: required for stable TCC (screen recording) attribution
 codesign --force --sign - "${APP_BUNDLE}" >/dev/null 2>&1
 
