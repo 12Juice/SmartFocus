@@ -524,7 +524,9 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                 // makes the post-cooldown check see cur == topID and
                 // short-circuit forever — the vacuum never gets fixed.
                 var keepPreviousAnchor = false
-                defer { if !keepPreviousAnchor { self.topID = nextID } }
+                defer {
+                    if !keepPreviousAnchor { self.topID = nextID }
+                }
 
                 guard previousID != 0, !previousStillOnScreen else { return }
 
@@ -606,7 +608,12 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                   let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != ownPID,
                   let name = w[kCGWindowOwnerName as String] as? String, !name.isEmpty,
                   let id = w[kCGWindowNumber as String] as? CGWindowID,
-                  !blacklist.contains(name)
+                  !blacklist.contains(name),
+                  // Skip tiny floating panels/widgets (BetterDisplay HUDs, status
+                  // panels...): they are layer-0 windows but worthless as a
+                  // focus-restore target — landing on one feels like nothing happened
+                  let frame = w[kCGWindowBounds as String].flatMap({ CGRect(dictionaryRepresentation: $0 as! CFDictionary) }),
+                  frame.width >= 120, frame.height >= 120
             else { continue }
             return (id, pid, name)
         }
