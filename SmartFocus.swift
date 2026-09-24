@@ -15,7 +15,7 @@ func log(_ message: String, level: LogLevel = .debug) {
 
 // MARK: - 配置管理
 struct Config: Codable {
-    static let defaultBlacklist: Set<String> = ["Finder", "Dock", "SystemUIServer", "WindowServer", "loginwindow"]
+    static let defaultBlacklist: Set<String> = ["Dock", "SystemUIServer", "WindowServer", "loginwindow"]
 
     var pollInterval: Double = 0.2
     var blacklist: Set<String> = Config.defaultBlacklist
@@ -544,7 +544,22 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                     log("🧊 冷却期，暂不干预（保留消失锚点，冷却后重判）")
                     return
                 }
-                guard let info = cur else { return }
+                // No qualifying window remains anywhere: land on Finder (the
+                // Desktop), matching where the system's own hide-fallback ends
+                // up — Finder can hold focus with zero windows. Skip when
+                // Finder is already frontmost (we're on the Desktop already).
+                guard let info = cur else {
+                    if let front = NSWorkspace.shared.frontmostApplication,
+                       front.bundleIdentifier == "com.apple.finder" {
+                        log("🏠 已在访达/桌面")
+                        return
+                    }
+                    if let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first,
+                       finder.activate() {
+                        log("🏠 无可用窗口，回落到访达/桌面")
+                    }
+                    return
+                }
                 self.doFocus(info)
                 log("🎯 焦点切换 -> \(info.name) (PID: \(info.pid))")
             }
