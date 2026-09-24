@@ -162,6 +162,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private var burstTimer: Timer?
     private var burstRemaining = 0
     private var isChecking = false
+    private var interventionCooldownUntil = Date.distantPast
     private let checkQueue = DispatchQueue(label: "com.baikong.smartfocus.check", qos: .userInteractive)
     private var configWatcher: DispatchSourceFileSystemObject?
     private var statusMenuItem: NSMenuItem!
@@ -176,6 +177,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         LogRedirector.shared.debugEnabled = config.debugLogging
         
         setupMenuBar()
+        setupMainMenu()
         setupWorkspaceObservers()
         startTimer()
         watchConfig()
@@ -221,19 +223,21 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         menu.addItem(statusMenuItem)
         
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "🖥️ 打开控制台", action: #selector(showConsole), keyEquivalent: "c"))
-        menu.addItem(NSMenuItem(title: "🗑️ 清空控制台", action: #selector(clearConsole), keyEquivalent: "k"))
+        // No key equivalents: ⌘C/⌘Q etc. must never be hijacked from the active
+        // app while our console window or menu has focus.
+        menu.addItem(NSMenuItem(title: "🖥️ 打开控制台", action: #selector(showConsole), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🗑️ 清空控制台", action: #selector(clearConsole), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "🔄 重载配置", action: #selector(reloadConfig), keyEquivalent: "r"))
-        debugLogMenuItem = NSMenuItem(title: "🐞 调试日志", action: #selector(toggleDebugLogging), keyEquivalent: "d")
+        menu.addItem(NSMenuItem(title: "🔄 重载配置", action: #selector(reloadConfig), keyEquivalent: ""))
+        debugLogMenuItem = NSMenuItem(title: "🐞 调试日志", action: #selector(toggleDebugLogging), keyEquivalent: "")
         debugLogMenuItem.state = config.debugLogging ? .on : .off
         menu.addItem(debugLogMenuItem)
-        launchAtLoginMenuItem = NSMenuItem(title: "🚀 开机自启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "l")
+        launchAtLoginMenuItem = NSMenuItem(title: "🚀 开机自启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         menu.addItem(launchAtLoginMenuItem)
         updateLaunchAtLoginState()
-        menu.addItem(NSMenuItem(title: "📝 打开配置文件", action: #selector(openConfigFile), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem(title: "📝 打开配置文件", action: #selector(openConfigFile), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "❌ 退出 SmartFocus", action: #selector(quitApp), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "❌ 退出 SmartFocus", action: #selector(quitApp), keyEquivalent: ""))
         
         statusItem.menu = menu
     }
@@ -241,6 +245,22 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     @objc private func showConsole() {
         consoleWC.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Without a mainMenu, standard edit commands (⌘C/⌘A) never dispatch inside
+    /// accessory (LSUIElement) apps — a minimal Edit menu fixes text selection
+    /// in the console. It only takes effect while our own window is key, so it
+    /// cannot hijack shortcuts from other apps (the accessory policy keeps the
+    /// menu bar itself hidden).
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+        NSApp.mainMenu = mainMenu
     }
     
     @objc private func clearConsole() {
@@ -343,26 +363,60 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         let nc = NSWorkspace.shared.notificationCenter
         [NSWorkspace.didHideApplicationNotification,
          NSWorkspace.didDeactivateApplicationNotification,
-         NSWorkspace.didTerminateApplicationNotification].forEach {
+         NSWorkspace.didTerminateApplicationNotification,
+         NSWorkspace.didActivateApplicationNotification,
+         NSWorkspace.activeSpaceDidChangeNotification].forEach {
             nc.addObserver(self, selector: #selector(handleWorkspaceEvent(_:)), name: $0, object: nil)
         }
     }
 
     @objc private func handleWorkspaceEvent(_ note: Notification) {
-        // didDeactivate fires on every ordinary app switch; a short delay lets the
-        // system's own focus settling finish first. It can stay short because the
-        // "accept the system's fallback" check inside tick prevents fighting it.
-        let delay: TimeInterval = note.name == NSWorkspace.didDeactivateApplicationNotification ? 0.05 : 0
-        startBurst(initialDelay: delay)
+        switch note.name {
+        case NSWorkspace.didActivateApplicationNotification:
+            // A fresh activation means the user/system just chose an app
+            // (AltTab landing, window deminimize): never fight it. But an
+            // activation landing on a BLACKLISTED app is a failed fallback,
+            // not a user choice — that is exactly when we must stay armed.
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+               let name = app.localizedName,
+               !config.blacklist.contains(name) {
+                // 200ms: switcher landings settle well within that; longer
+                // cooldowns delay close-triggered interventions too much
+                interventionCooldownUntil = Date().addingTimeInterval(0.2)
+                schedulePostCooldownCheck(after: 0.2)
+            }
+            startBurst()
+        case NSWorkspace.activeSpaceDidChangeNotification:
+            // Space-switch animation rewrites the on-screen window list
+            // wholesale while target windows have not landed yet; wait it out.
+            interventionCooldownUntil = Date().addingTimeInterval(0.5)
+            schedulePostCooldownCheck(after: 0.5)
+            startBurst(initialDelay: 0.3)
+        default:
+            // didDeactivate fires on every ordinary app switch; a short delay lets
+            // the system's own focus settling finish first. It can stay short
+            // because the "accept the system's fallback" check prevents fighting.
+            let delay: TimeInterval = note.name == NSWorkspace.didDeactivateApplicationNotification ? 0.05 : 0
+            startBurst(initialDelay: delay)
+        }
+    }
+
+    /// The burst may burn out entirely inside the cooldown window; fire one
+    /// check the moment the cooldown expires so intervention doesn't have to
+    /// wait for the next fallback-poll tick.
+    private func schedulePostCooldownCheck(after seconds: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            self?.tick()
+        }
     }
 
     /// A single debounced check loses the race against close animations and
-    /// delayed app termination. Instead, on any workspace event we open a
-    /// 500ms high-frequency detection window (50ms x 10 ticks) that keeps
+    /// delayed app termination. Instead, on any workspace event we open an
+    /// 800ms high-frequency detection window (50ms x 16 ticks) that keeps
     /// watching until the window list settles; event storms (rapid Cmd+W)
     /// extend the window. Idle CPU cost stays at the fallback timer's level.
     private func startBurst(initialDelay: TimeInterval = 0) {
-        burstRemaining = 10
+        burstRemaining = 16
         guard burstTimer == nil else { return }
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] t in
             guard let self = self else { t.invalidate(); return }
@@ -464,7 +518,13 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                 guard cur?.windowNumber != previousID else { return }
 
                 let nextID = cur?.windowNumber ?? 0
-                defer { self.topID = nextID }
+                // Consume the anchor (update topID) only on paths that RESOLVED
+                // the disappearance. The cooldown path keeps the old anchor:
+                // consuming the "window disappeared" evidence while unhandled
+                // makes the post-cooldown check see cur == topID and
+                // short-circuit forever — the vacuum never gets fixed.
+                var keepPreviousAnchor = false
+                defer { if !keepPreviousAnchor { self.topID = nextID } }
 
                 guard previousID != 0, !previousStillOnScreen else { return }
 
@@ -473,10 +533,18 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                     log("✅ 系统已自行回落焦点，跳过干预")
                     return
                 }
-                if let info = cur {
-                    self.doFocus(info)
-                    log("🎯 焦点切换 -> \(info.name) (PID: \(info.pid))")
+                // Cooldown is the only switcher guard we need: it covers exactly
+                // the "user just chose an app / space is animating" transients.
+                // Outside a cooldown, an unusable frontmost after a window
+                // disappearance is a real vacuum — act immediately.
+                if Date() < self.interventionCooldownUntil {
+                    keepPreviousAnchor = true
+                    log("🧊 冷却期，暂不干预（保留消失锚点，冷却后重判）")
+                    return
                 }
+                guard let info = cur else { return }
+                self.doFocus(info)
+                log("🎯 焦点切换 -> \(info.name) (PID: \(info.pid))")
             }
         }
     }
@@ -546,14 +614,23 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     }
 
     private func doFocus(_ info: (windowNumber: CGWindowID, pid: pid_t, name: String)) {
-        guard let app = NSRunningApplication(processIdentifier: info.pid) else { return }
+        guard let app = NSRunningApplication(processIdentifier: info.pid) else {
+            log("⚠️ 目标进程不存在 (PID: \(info.pid))", level: .error)
+            return
+        }
         // Before macOS 14, a bare activate() often lost to the system's own focus
         // fallback (visible double-switches); macOS 14+ deprecated the flag and
         // changed activate() semantics, where it has no effect anyway.
+        let ok: Bool
         if #available(macOS 14.0, *) {
-            app.activate()
+            ok = app.activate()
         } else {
-            app.activate(options: [.activateIgnoringOtherApps])
+            ok = app.activate(options: [.activateIgnoringOtherApps])
+        }
+        if !ok {
+            // macOS 15+ focus-stealing protection can reject activate() from a
+            // background app that lacks recent user interaction
+            log("⚠️ activate(\(info.name)) 被系统拒绝", level: .error)
         }
     }
 }
