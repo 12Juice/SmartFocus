@@ -160,7 +160,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     convenience init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 580),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            // No .miniaturizable: without a Dock icon a minimized window has
+            // nowhere to go and would be unreachable (reopen sees a window
+            // and skips showing)
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered, defer: false
         )
         window.title = "SmartFocus"
@@ -202,11 +205,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let reloadButton = button("重载配置", id: "reload")
         let configButton = button("打开配置文件", id: "openConfig")
         let clearButton = button("清空", id: "clearLog")
-        let quitButton = button("退出", id: "quit")
+        let quitButton = button("退出应用", id: "quit")
         // Destructive action: own row, red label. Bordered push buttons
         // ignore contentTintColor for the title; an attributed title tints.
         quitButton.attributedTitle = NSAttributedString(
-            string: "退出",
+            string: "退出应用",
             attributes: [.foregroundColor: NSColor.systemRed]
         )
 
@@ -1033,7 +1036,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
 let app = NSApplication.shared
 let delegate = SmartFocusApp()
 app.delegate = delegate
-// Regular app: Dock icon + main window (Spotlight/Dock reachable); the menu
-// bar item stays as a secondary entry point for when the bar is visible.
-app.setActivationPolicy(.regular)
+// Accessory agent: no Dock icon. The window is reachable via Spotlight /
+// menu bar; ✕ only closes the window — quit is the app's own button only.
+app.setActivationPolicy(.accessory)
 app.run()
