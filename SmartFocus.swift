@@ -156,20 +156,47 @@ class ConsoleWindowController: NSWindowController, NSWindowDelegate {
         contentView.addSubview(scrollView)
     }
     
+    // DateFormatter is expensive to create; share one instance instead of
+    // building a fresh formatter per log line (debug bursts log at 20 Hz).
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .medium
+        f.dateStyle = .none
+        return f
+    }()
+
+    // Rolling cap on the console buffer: unbounded textStorage growth leaks
+    // memory over long sessions. When exceeded, drop the oldest half,
+    // cutting at a line boundary.
+    private var logChars = 0
+    private let maxLogChars = 200_000
+
     func appendLog(_ message: String, isError: Bool = false) {
-        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        let logLine = "[\(timestamp)] \(message)\n"
+        let logLine = "[\(Self.timeFormatter.string(from: Date()))] \(message)\n"
 
         DispatchQueue.main.async { [weak self] in
+            guard let self = self, let storage = self.textView.textStorage else { return }
             let attributes: [NSAttributedString.Key: Any] = isError ? [.foregroundColor: NSColor.systemRed] : [:]
-            self?.textView.textStorage?.append(NSAttributedString(string: logLine, attributes: attributes))
-            self?.textView.scrollRangeToVisible(NSRange(location: self?.textView.string.count ?? 0, length: 0))
+            storage.append(NSAttributedString(string: logLine, attributes: attributes))
+            self.logChars += logLine.count
+            if self.logChars > self.maxLogChars, storage.length > self.maxLogChars / 2 {
+                let cut = self.logChars - self.maxLogChars / 2
+                let full = storage.string
+                if let start = full.index(full.startIndex, offsetBy: cut, limitedBy: full.endIndex),
+                   let newline = full[start...].firstIndex(of: "\n") {
+                    let len = full.distance(from: full.startIndex, to: newline) + 1
+                    storage.replaceCharacters(in: NSRange(location: 0, length: len), with: "")
+                    self.logChars -= len
+                }
+            }
+            self.textView.scrollRangeToVisible(NSRange(location: self.textView.string.count, length: 0))
         }
     }
-    
+
     func clearLog() {
         DispatchQueue.main.async { [weak self] in
             self?.textView.string = ""
+            self?.logChars = 0
         }
     }
 }
@@ -288,6 +315,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         menu.addItem(launchAtLoginMenuItem)
         updateLaunchAtLoginState()
         menu.addItem(NSMenuItem(title: "📝 打开配置文件", action: #selector(openConfigFile), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🔐 屏幕录制权限设置", action: #selector(openScreenRecordingSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "❌ 退出 SmartFocus", action: #selector(quitApp), keyEquivalent: ""))
         
@@ -395,6 +423,15 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         // Self-heal in case the file was deleted while the app is running
         Config.ensureConfigFile()
         NSWorkspace.shared.open(Config.configURL)
+    }
+
+    /// Deep-link to the Screen Recording pane: the tool is dead without that
+    /// permission, so recovery should be one click from the menu bar.
+    @objc private func openScreenRecordingSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+        if !NSWorkspace.shared.open(url) {
+            log("⚠️ 无法打开系统设置的屏幕录制页", level: .error)
+        }
     }
     
     @objc private func quitApp() {
