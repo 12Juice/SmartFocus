@@ -13,22 +13,25 @@ macOS sometimes drops focus to the Desktop/Finder after you close a window. Smar
 - **Launch at login** (macOS 13+ via `SMAppService`)
 - **Screen-recording permission watchdog**: menu bar turns into ⚠️ when the permission is lost, with recovery detection
 
-## Build
+## Build & Package
 
 ```bash
 ./build.sh          # produces build/SmartFocus.app (ad-hoc signed)
-open build/SmartFocus.app
+./package.sh        # additionally produces build/SmartFocus-<version>.dmg
+                    # (drag-to-install layout with an /Applications symlink)
 ```
 
 Requires Xcode Command Line Tools. Grant **Screen Recording** permission (System Settings → Privacy & Security) on first launch.
 
 ## Install
 
+Open the DMG and drag SmartFocus to Applications — or directly:
+
 ```bash
 cp -R build/SmartFocus.app /Applications/
 ```
 
-Note: with ad-hoc signing, re-building invalidates the registered login item and TCC grants — re-toggle them after upgrading, or sign with a stable local certificate.
+Note: with ad-hoc signing, re-building invalidates the registered login item and TCC grants — re-toggle them after upgrading, or sign with a stable local certificate. The DMG is not notarized (no Developer ID certificate); on other machines Gatekeeper will challenge it — right-click → Open, then confirm.
 
 ## Config
 
@@ -36,11 +39,13 @@ Note: with ad-hoc signing, re-building invalidates the registered login item and
 
 ```json
 {
-  "blacklist": ["Finder", "Dock", "SystemUIServer", "WindowServer", "loginwindow"],
+  "blacklist": ["com.apple.dock", "com.apple.systemuiserver", "com.apple.loginwindow", "WindowServer"],
   "debugLogging": false,
   "pollInterval": 0.2
 }
 ```
+
+Blacklist entries match by bundleIdentifier (preferred — stable across locales) or by app name (fallback).
 
 ## License
 
