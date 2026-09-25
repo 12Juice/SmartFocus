@@ -15,7 +15,9 @@ func log(_ message: String, level: LogLevel = .debug) {
 
 // MARK: - 配置管理
 struct Config: Codable {
-    static let defaultBlacklist: Set<String> = ["Dock", "SystemUIServer", "WindowServer", "loginwindow"]
+    // Bundle ids are the primary match key; WindowServer stays as a name
+    // because it is a root process NSRunningApplication cannot resolve.
+    static let defaultBlacklist: Set<String> = ["com.apple.dock", "com.apple.systemuiserver", "com.apple.loginwindow", "WindowServer"]
 
     var pollInterval: Double = 0.2
     var blacklist: Set<String> = Config.defaultBlacklist
@@ -76,6 +78,45 @@ struct Config: Codable {
         // the timer is only a fallback, so ultra-small intervals are pointless.
         config.pollInterval = max(config.pollInterval, 0.1)
         return config
+    }
+}
+
+// MARK: - 黑名单匹配器
+/// Matches blacklist entries against apps. Bundle ids are the primary key:
+/// unlike localizedName ("Finder" vs "访达"), they are stable across locales
+/// and app rename events. Name matching stays as a fallback — for entries
+/// written as display names, and for system processes (WindowServer) that
+/// NSRunningApplication cannot see. The window list exposes only owner
+/// name/PID, so bundle-id entries are resolved to a PID set up front and
+/// re-resolved whenever apps launch or terminate (PIDs are not stable).
+struct BlacklistMatcher {
+    private let entries: Set<String>
+    private let pids: Set<pid_t>
+
+    init(entries: Set<String>) {
+        self.entries = entries
+        var resolved = Set<pid_t>()
+        for entry in entries where entry.contains(".") {
+            // Dotted entries look like bundle ids; resolve their running
+            // processes once here so the window scan can match by PID.
+            resolved.formUnion(
+                NSRunningApplication.runningApplications(withBundleIdentifier: entry).map(\.processIdentifier)
+            )
+        }
+        self.pids = resolved
+    }
+
+    func matches(_ app: NSRunningApplication) -> Bool {
+        matches(name: app.localizedName,
+                pid: app.processIdentifier,
+                bundleIdentifier: app.bundleIdentifier)
+    }
+
+    func matches(name: String?, pid: pid_t? = nil, bundleIdentifier: String? = nil) -> Bool {
+        if let bundleIdentifier, entries.contains(bundleIdentifier) { return true }
+        if let name, !name.isEmpty, entries.contains(name) { return true }
+        if let pid, pids.contains(pid) { return true }
+        return false
     }
 }
 
@@ -158,6 +199,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private var menuBarIcon: NSImage?
     private let ownPID = getpid()
     private var config = Config.load()
+    private var blacklistMatcher = BlacklistMatcher(entries: [])
     private var timer: Timer?
     private var burstTimer: Timer?
     private var burstRemaining = 0
@@ -183,6 +225,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         
         Config.ensureConfigFile()
         config = Config.load()
+        blacklistMatcher = BlacklistMatcher(entries: config.blacklist)
         LogRedirector.shared.debugEnabled = config.debugLogging
         
         setupMenuBar()
@@ -291,6 +334,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     /// (Re)load config from disk and propagate it to the timer / debug state / menu
     private func applyConfig() {
         config = Config.load()
+        blacklistMatcher = BlacklistMatcher(entries: config.blacklist)
         startTimer()
         applyDebugState()
     }
@@ -381,6 +425,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         [NSWorkspace.didHideApplicationNotification,
          NSWorkspace.didDeactivateApplicationNotification,
          NSWorkspace.didTerminateApplicationNotification,
+         NSWorkspace.didLaunchApplicationNotification,
          NSWorkspace.didActivateApplicationNotification,
          NSWorkspace.activeSpaceDidChangeNotification].forEach {
             nc.addObserver(self, selector: #selector(handleWorkspaceEvent(_:)), name: $0, object: nil)
@@ -395,8 +440,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             // activation landing on a BLACKLISTED app is a failed fallback,
             // not a user choice — that is exactly when we must stay armed.
             if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-               let name = app.localizedName,
-               !config.blacklist.contains(name) {
+               !blacklistMatcher.matches(app) {
                 // 200ms: switcher landings settle well within that; longer
                 // cooldowns delay close-triggered interventions too much
                 interventionCooldownUntil = Date().addingTimeInterval(0.2)
@@ -410,6 +454,13 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             schedulePostCooldownCheck(after: 0.5)
             startBurst(initialDelay: 0.3)
         default:
+            // App set changed: re-resolve bundle-id entries to fresh PIDs (a
+            // relaunched blacklisted app gets a new PID; a stale one could be
+            // reused by an unrelated process).
+            if note.name == NSWorkspace.didLaunchApplicationNotification ||
+               note.name == NSWorkspace.didTerminateApplicationNotification {
+                blacklistMatcher = BlacklistMatcher(entries: config.blacklist)
+            }
             // didDeactivate fires on every ordinary app switch; a short delay lets
             // the system's own focus settling finish first. It can stay short
             // because the "accept the system's fallback" check prevents fighting.
@@ -514,7 +565,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private func tick() {
         guard !isChecking else { return }
         isChecking = true
-        let blacklist = config.blacklist // value copy, safe to read off-main
+        let blacklist = blacklistMatcher // value copy, safe to read off-main
         checkQueue.async { [weak self] in
             guard let self = self else { return }
             let list = self.snapshot()
@@ -605,11 +656,10 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     /// The window check is essential — apps like Chrome/VS Code stay frontmost
     /// with zero windows after their last window closes, which is exactly the
     /// focus vacuum this tool exists to fix.
-    private func systemSettledOnUsableApp(blacklist: Set<String>, windowList: [[String: Any]]) -> Bool {
+    private func systemSettledOnUsableApp(blacklist: BlacklistMatcher, windowList: [[String: Any]]) -> Bool {
         guard let front = NSWorkspace.shared.frontmostApplication,
               front.processIdentifier != ownPID,
-              let name = front.localizedName,
-              !blacklist.contains(name),
+              !blacklist.matches(front),
               appHasVisibleWindow(pid: front.processIdentifier, in: windowList)
         else { return false }
         return true
@@ -651,13 +701,13 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         list.contains { ($0[kCGWindowNumber as String] as? CGWindowID) == id }
     }
 
-    private func firstUsable(in list: [[String: Any]], blacklist: Set<String>) -> (windowNumber: CGWindowID, pid: pid_t, name: String)? {
+    private func firstUsable(in list: [[String: Any]], blacklist: BlacklistMatcher) -> (windowNumber: CGWindowID, pid: pid_t, name: String)? {
         for w in list {
             guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
                   let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != ownPID,
                   let name = w[kCGWindowOwnerName as String] as? String, !name.isEmpty,
                   let id = w[kCGWindowNumber as String] as? CGWindowID,
-                  !blacklist.contains(name),
+                  !blacklist.matches(name: name, pid: pid),
                   // Skip tiny floating panels/widgets (BetterDisplay HUDs, status
                   // panels...): they are layer-0 windows but worthless as a
                   // focus-restore target — landing on one feels like nothing happened
