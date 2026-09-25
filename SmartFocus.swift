@@ -120,42 +120,13 @@ struct BlacklistMatcher {
     }
 }
 
-// MARK: - 控制台窗口管理器
-class ConsoleWindowController: NSWindowController, NSWindowDelegate {
-    private var textView: NSTextView!
-    private var scrollView: NSScrollView!
-    
-    convenience init() {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered, defer: false
-        )
-        window.title = "SmartFocus Console"
-        window.minSize = NSSize(width: 400, height: 200)
-        window.isReleasedWhenClosed = false 
-        
-        self.init(window: window)
-        setupUI()
-    }
-    
-    private func setupUI() {
-        guard let contentView = window?.contentView else { return }
-        
-        scrollView = NSScrollView(frame: contentView.bounds)
-        scrollView.autoresizingMask = [.width, .height]
-        
-        textView = NSTextView(frame: scrollView.contentView.bounds)
-        textView.isEditable = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.textColor = .labelColor
-        textView.backgroundColor = .textBackgroundColor
-        textView.autoresizingMask = [.width, .height]
-        
-        scrollView.documentView = textView
-        contentView.addSubview(scrollView)
-    }
-    
+// MARK: - 主窗口控制器
+/// The app's main control panel: status line, quick toggles/actions, and the
+/// embedded log console (replaces the old standalone console window). A real
+/// window keeps the app reachable from Dock/Spotlight even when the user
+/// hides the menu bar. All UI actions delegate back to the app object so the
+/// menu bar items and window controls share one code path.
+final class MainWindowController: NSWindowController, NSWindowDelegate {
     // DateFormatter is expensive to create; share one instance instead of
     // building a fresh formatter per log line (debug bursts log at 20 Hz).
     private static let timeFormatter: DateFormatter = {
@@ -165,17 +136,233 @@ class ConsoleWindowController: NSWindowController, NSWindowDelegate {
         return f
     }()
 
-    // Rolling cap on the console buffer: unbounded textStorage growth leaks
+    // Rolling cap on the log buffer: unbounded textStorage growth leaks
     // memory over long sessions. When exceeded, drop the oldest half,
     // cutting at a line boundary.
     private var logChars = 0
     private let maxLogChars = 200_000
 
+    private var statusLabel: NSTextField!
+    private var permissionButton: NSButton!
+    private var infoLabel: NSTextField!
+    private var debugSwitch: NSSwitch!
+    private var loginSwitch: NSSwitch!
+    private var logTextView: NSTextView!
+
+    var onToggleDebugLogging: (() -> Void)?
+    var onToggleLaunchAtLogin: (() -> Void)?
+    var onReloadConfig: (() -> Void)?
+    var onOpenConfigFile: (() -> Void)?
+    var onOpenPermissionSettings: (() -> Void)?
+    var onClearLog: (() -> Void)?
+    var onQuit: (() -> Void)?
+
+    convenience init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 580),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered, defer: false
+        )
+        window.title = "SmartFocus"
+        window.minSize = NSSize(width: 440, height: 440)
+        window.isReleasedWhenClosed = false
+        self.init(window: window)
+        window.delegate = self
+        buildUI()
+        window.center()
+    }
+
+    private func buildUI() {
+        guard let contentView = window?.contentView else { return }
+
+        statusLabel = NSTextField(labelWithString: "● 运行中")
+        statusLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        statusLabel.textColor = .systemGreen
+
+        // Only relevant while the permission is actually lost; refresh()
+        // toggles visibility next to the status line.
+        permissionButton = NSButton(title: "屏幕录制权限设置", target: self, action: #selector(buttonClicked(_:)))
+        permissionButton.bezelStyle = .rounded
+        permissionButton.identifier = NSUserInterfaceItemIdentifier("permission")
+        permissionButton.controlSize = .small
+        permissionButton.isHidden = true
+
+        infoLabel = NSTextField(labelWithString: "")
+        infoLabel.font = .systemFont(ofSize: 11)
+        infoLabel.textColor = .secondaryLabelColor
+
+        debugSwitch = NSSwitch()
+        debugSwitch.target = self
+        debugSwitch.action = #selector(switchChanged(_:))
+
+        loginSwitch = NSSwitch()
+        loginSwitch.target = self
+        loginSwitch.action = #selector(switchChanged(_:))
+
+        let reloadButton = button("重载配置", id: "reload")
+        let configButton = button("打开配置文件", id: "openConfig")
+        let clearButton = button("清空", id: "clearLog")
+        let quitButton = button("退出", id: "quit")
+        // Destructive action: own row, red label. Bordered push buttons
+        // ignore contentTintColor for the title; an attributed title tints.
+        quitButton.attributedTitle = NSAttributedString(
+            string: "退出",
+            attributes: [.foregroundColor: NSColor.systemRed]
+        )
+
+        logTextView = NSTextView()
+        logTextView.isEditable = false
+        logTextView.isRichText = false
+        logTextView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        logTextView.textColor = .labelColor
+        logTextView.backgroundColor = .textBackgroundColor
+
+        let logScroll = NSScrollView()
+        logScroll.hasVerticalScroller = true
+        logScroll.borderType = .lineBorder
+        logScroll.documentView = logTextView
+        logScroll.translatesAutoresizingMaskIntoConstraints = false
+        // Document view follows the clip view; Auto Layout governs the
+        // scroll view itself (same recipe the old console used).
+        logTextView.frame = logScroll.contentView.bounds
+        logTextView.autoresizingMask = [.width, .height]
+
+        // Status line with the permission-recovery button to its right,
+        // shown only while the permission is lost
+        let statusRow = NSStackView()
+        statusRow.orientation = .horizontal
+        statusRow.spacing = 8
+        statusRow.addArrangedSubview(statusLabel)
+        statusRow.addArrangedSubview(permissionButton)
+
+        let buttons = NSStackView(views: [reloadButton, configButton])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+
+        let controls = NSStackView()
+        controls.orientation = .vertical
+        controls.alignment = .leading
+        controls.spacing = 10
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        controls.addArrangedSubview(statusRow)
+        controls.addArrangedSubview(infoLabel)
+        controls.addArrangedSubview(makeSeparator())
+        controls.addArrangedSubview(makeRow("调试日志", control: debugSwitch))
+        controls.addArrangedSubview(makeRow("开机自启动", control: loginSwitch))
+        controls.addArrangedSubview(makeSeparator())
+        controls.addArrangedSubview(buttons)
+
+        // Log section: the header row hugs its scroll view (same margins,
+        // tight spacing) so 日志/清空 read as part of the log, while the
+        // status/toggle/button rows above stay their own section
+        let logHeader = makeRow("日志", control: clearButton)
+        let logSection = NSStackView()
+        logSection.orientation = .vertical
+        logSection.spacing = 4
+        logSection.translatesAutoresizingMaskIntoConstraints = false
+        logSection.addArrangedSubview(logHeader)
+        logSection.addArrangedSubview(logScroll)
+        logHeader.widthAnchor.constraint(equalTo: logSection.widthAnchor).isActive = true
+
+        // Quit as a detached footer row at the very bottom, visually apart
+        // from the config controls
+        let quitRow = NSStackView()
+        quitRow.orientation = .horizontal
+        let quitSpacer = NSView()
+        quitSpacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        quitRow.addArrangedSubview(quitSpacer)
+        quitRow.addArrangedSubview(quitButton)
+
+        let outer = NSStackView()
+        outer.orientation = .vertical
+        outer.spacing = 12
+        outer.translatesAutoresizingMaskIntoConstraints = false
+        outer.addArrangedSubview(controls)
+        outer.addArrangedSubview(logSection)
+        outer.addArrangedSubview(quitRow)
+        quitRow.widthAnchor.constraint(equalTo: outer.widthAnchor).isActive = true
+        contentView.addSubview(outer)
+
+        // Stretch every section to the panel width; the log takes the rest.
+        controls.arrangedSubviews.forEach {
+            $0.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
+        }
+        NSLayoutConstraint.activate([
+            outer.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
+            outer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            outer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            outer.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -16),
+            logScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
+        ])
+    }
+
+    private func button(_ title: String, id: String) -> NSButton {
+        let b = NSButton(title: title, target: self, action: #selector(buttonClicked(_:)))
+        b.bezelStyle = .rounded
+        b.identifier = NSUserInterfaceItemIdentifier(id)
+        return b
+    }
+
+    private func makeRow(_ title: String, control: NSView) -> NSStackView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 8
+        let label = NSTextField(labelWithString: title)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        row.addArrangedSubview(label)
+        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(control)
+        return row
+    }
+
+    private func makeSeparator() -> NSView {
+        let line = NSBox()
+        line.boxType = .separator
+        return line
+    }
+
+    @objc private func switchChanged(_ sender: NSSwitch) {
+        if sender === debugSwitch {
+            onToggleDebugLogging?()
+        } else if sender === loginSwitch {
+            onToggleLaunchAtLogin?()
+        }
+    }
+
+    @objc private func buttonClicked(_ sender: NSButton) {
+        switch sender.identifier?.rawValue {
+        case "reload": onReloadConfig?()
+        case "openConfig": onOpenConfigFile?()
+        case "permission": onOpenPermissionSettings?()
+        case "clearLog": onClearLog?()
+        case "quit": onQuit?()
+        default: break
+        }
+    }
+
+    /// Sync the panel with app state; call after any config/permission change.
+    func refresh(permissionLost: Bool, pollInterval: Double, blacklistCount: Int,
+                 version: String, debugEnabled: Bool, launchAtLogin: Bool?) {
+        statusLabel.stringValue = permissionLost ? "⚠️ 屏幕录制权限已失效" : "● 运行中"
+        statusLabel.textColor = permissionLost ? .systemRed : .systemGreen
+        // The recovery button only exists while recovery is needed
+        permissionButton.isHidden = !permissionLost
+        infoLabel.stringValue = "间隔 \(pollInterval)s · 黑名单 \(blacklistCount) 项 · v\(version)"
+        debugSwitch.state = debugEnabled ? .on : .off
+        if let launchAtLogin {
+            loginSwitch.isEnabled = true
+            loginSwitch.state = launchAtLogin ? .on : .off
+        } else {
+            loginSwitch.isEnabled = false
+        }
+    }
+
     func appendLog(_ message: String, isError: Bool = false) {
         let logLine = "[\(Self.timeFormatter.string(from: Date()))] \(message)\n"
 
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, let storage = self.textView.textStorage else { return }
+            guard let self = self, let storage = self.logTextView.textStorage else { return }
             let attributes: [NSAttributedString.Key: Any] = isError ? [.foregroundColor: NSColor.systemRed] : [:]
             storage.append(NSAttributedString(string: logLine, attributes: attributes))
             self.logChars += logLine.count
@@ -189,13 +376,13 @@ class ConsoleWindowController: NSWindowController, NSWindowDelegate {
                     self.logChars -= len
                 }
             }
-            self.textView.scrollRangeToVisible(NSRange(location: self.textView.string.count, length: 0))
+            self.logTextView.scrollRangeToVisible(NSRange(location: self.logTextView.string.count, length: 0))
         }
     }
 
     func clearLog() {
         DispatchQueue.main.async { [weak self] in
-            self?.textView.string = ""
+            self?.logTextView.string = ""
             self?.logChars = 0
         }
     }
@@ -204,14 +391,14 @@ class ConsoleWindowController: NSWindowController, NSWindowDelegate {
 // MARK: - 日志重定向器
 class LogRedirector {
     static let shared = LogRedirector()
-    var console: ConsoleWindowController?
+    var console: MainWindowController?
     var debugEnabled = false
 
     func write(_ string: String, level: LogLevel) {
         guard level == .error || debugEnabled else { return }
         // 保持 stderr 输出，确保 Xcode / 终端调试器可见
         fputs(string, stderr)
-        // 同步更新到 App UI 控制台
+        // 同步更新到主窗口日志区
         console?.appendLog(string.trimmingCharacters(in: .newlines), isError: level == .error)
     }
 }
@@ -219,7 +406,7 @@ class LogRedirector {
 // MARK: - 菜单栏应用主体
 class SmartFocusApp: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var consoleWC = ConsoleWindowController()
+    private var mainWC = MainWindowController()
     
     private var topID: CGWindowID = 0
     private var screenPermissionLost = false
@@ -235,8 +422,11 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     // Consecutive activation failures for one target (window ID, or 0 for the
     // Finder fallback): after 3 strikes we give up and let the anchor roll
     // forward, so a permanently rejected activate() cannot retry forever.
+    // The budget is per disappearance episode (identified by the vanished
+    // anchor window): a fresh event must not inherit a stale strike count.
     private var focusFailures = 0
     private var focusFailureTarget: CGWindowID?
+    private var focusFailureAnchor: CGWindowID = 0
     private let checkQueue = DispatchQueue(label: "com.baikong.smartfocus.check", qos: .userInteractive)
     private var configWatcher: DispatchSourceFileSystemObject?
     // True right after persistConfig's own write: lets the watcher skip the
@@ -244,24 +434,44 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     // replaces the watched inode).
     private var suppressNextConfigEvent = false
     private var statusMenuItem: NSMenuItem!
-    private var debugLogMenuItem: NSMenuItem!
-    private var launchAtLoginMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        LogRedirector.shared.console = consoleWC
-        
+        LogRedirector.shared.console = mainWC
+
         Config.ensureConfigFile()
         config = Config.load()
         blacklistMatcher = BlacklistMatcher(entries: config.blacklist)
         LogRedirector.shared.debugEnabled = config.debugLogging
-        
+
         setupMenuBar()
         setupMainMenu()
         setupWorkspaceObservers()
         startTimer()
         watchConfig()
+
+        // Window actions share the menu items' selectors so there is one
+        // code path per action.
+        mainWC.onToggleDebugLogging = { [weak self] in self?.toggleDebugLogging() }
+        mainWC.onToggleLaunchAtLogin = { [weak self] in self?.toggleLaunchAtLogin() }
+        mainWC.onReloadConfig = { [weak self] in self?.reloadConfig() }
+        mainWC.onOpenConfigFile = { [weak self] in self?.openConfigFile() }
+        mainWC.onOpenPermissionSettings = { [weak self] in self?.openScreenRecordingSettings() }
+        mainWC.onClearLog = { [weak self] in self?.clearLog() }
+        mainWC.onQuit = { [weak self] in self?.quitApp() }
+        refreshMainStatus()
+
         tick() // immediate first check: surfaces a missing screen-recording permission right away
-        log("⚡️ SmartFocus 已启动，控制台就绪")
+        showMainWindow()
+        log("⚡️ SmartFocus 已启动")
+    }
+
+    /// Spotlight/Dock activation of an already-running app lands here; bring
+    /// the panel back up so "open SmartFocus" always has a visible effect.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            showMainWindow()
+        }
+        return true
     }
     
     private func setupMenuBar() {
@@ -303,27 +513,19 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         
         menu.addItem(NSMenuItem.separator())
         // No key equivalents: ⌘C/⌘Q etc. must never be hijacked from the active
-        // app while our console window or menu has focus.
-        menu.addItem(NSMenuItem(title: "🖥️ 打开控制台", action: #selector(showConsole), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "🗑️ 清空控制台", action: #selector(clearConsole), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
+        // app while our window or menu has focus. Everything else lives in the
+        // main window; the bar menu stays minimal.
+        menu.addItem(NSMenuItem(title: "🪟 打开主窗口", action: #selector(showMainWindow), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "🔄 重载配置", action: #selector(reloadConfig), keyEquivalent: ""))
-        debugLogMenuItem = NSMenuItem(title: "🐞 调试日志", action: #selector(toggleDebugLogging), keyEquivalent: "")
-        debugLogMenuItem.state = config.debugLogging ? .on : .off
-        menu.addItem(debugLogMenuItem)
-        launchAtLoginMenuItem = NSMenuItem(title: "🚀 开机自启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
-        menu.addItem(launchAtLoginMenuItem)
-        updateLaunchAtLoginState()
         menu.addItem(NSMenuItem(title: "📝 打开配置文件", action: #selector(openConfigFile), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "🔐 屏幕录制权限设置", action: #selector(openScreenRecordingSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "❌ 退出 SmartFocus", action: #selector(quitApp), keyEquivalent: ""))
         
         statusItem.menu = menu
     }
     
-    @objc private func showConsole() {
-        consoleWC.showWindow(nil)
+    @objc private func showMainWindow() {
+        mainWC.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -343,9 +545,24 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
     
-    @objc private func clearConsole() {
-        consoleWC.clearLog()
-        log("🗑️ 控制台已清空")
+    @objc private func clearLog() {
+        mainWC.clearLog()
+        log("🗑️ 日志已清空")
+    }
+
+    /// Push app state into the main window's status line / switches.
+    private func refreshMainStatus() {
+        var launchAtLogin: Bool?
+        if #available(macOS 13.0, *) {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        mainWC.refresh(permissionLost: screenPermissionLost,
+                        pollInterval: config.pollInterval,
+                        blacklistCount: config.blacklist.count,
+                        version: version,
+                        debugEnabled: config.debugLogging,
+                        launchAtLogin: launchAtLogin)
     }
     
     @objc private func reloadConfig() {
@@ -356,6 +573,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     @objc private func toggleDebugLogging() {
         persistConfig { $0.debugLogging.toggle() }
         applyDebugState()
+        refreshMainStatus()
         log("🐞 调试日志已\(config.debugLogging ? "开启" : "关闭")")
     }
 
@@ -365,11 +583,11 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         blacklistMatcher = BlacklistMatcher(entries: config.blacklist)
         startTimer()
         applyDebugState()
+        refreshMainStatus()
     }
 
     private func applyDebugState() {
         LogRedirector.shared.debugEnabled = config.debugLogging
-        debugLogMenuItem?.state = config.debugLogging ? .on : .off
     }
 
     // MARK: - Launch at login
@@ -391,11 +609,8 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     }
 
     private func updateLaunchAtLoginState() {
-        guard #available(macOS 13.0, *) else {
-            launchAtLoginMenuItem.isHidden = true
-            return
-        }
-        launchAtLoginMenuItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        // The menu no longer mirrors this; the main window switch is the UI.
+        refreshMainStatus()
     }
 
     /// Merge a field mutation into the on-disk config before writing. Writing
@@ -667,7 +882,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                        finder.activate() {
                         resetFocusFailures()
                         log("🏠 无可用窗口，回落到访达/桌面")
-                    } else if shouldRetryActivation(target: 0) {
+                    } else if shouldRetryActivation(target: 0, anchor: previousID) {
                         keepPreviousAnchor = true
                     } else {
                         log("⚠️ 回落访达连续失败，放弃并重置锚点", level: .error)
@@ -677,7 +892,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                 if self.doFocus(info) {
                     resetFocusFailures()
                     log("🎯 焦点切换 -> \(info.name) (PID: \(info.pid))")
-                } else if shouldRetryActivation(target: info.windowNumber) {
+                } else if shouldRetryActivation(target: info.windowNumber, anchor: previousID) {
                     // Keep the disappearance evidence so the next tick retries;
                     // consuming it here would short-circuit forever (cur == topID).
                     keepPreviousAnchor = true
@@ -689,14 +904,18 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     }
 
     /// True when the system's own focus fallback landed on an app we consider
-    /// usable: not us, not blacklisted, AND it still owns a visible window.
-    /// The window check is essential — apps like Chrome/VS Code stay frontmost
-    /// with zero windows after their last window closes, which is exactly the
-    /// focus vacuum this tool exists to fix.
+    /// usable: not blacklisted, AND it still owns a visible window. The window
+    /// check is essential — apps like Chrome/VS Code stay frontmost with zero
+    /// windows after their last window closes, which is exactly the focus
+    /// vacuum this tool exists to fix. Ourselves: settled only while our own
+    /// window is on screen — the user is deliberately in our panel, and a
+    /// background window closing behind it is not a vacuum to fix.
     private func systemSettledOnUsableApp(blacklist: BlacklistMatcher, windowList: [[String: Any]]) -> Bool {
-        guard let front = NSWorkspace.shared.frontmostApplication,
-              front.processIdentifier != ownPID,
-              !blacklist.matches(front),
+        guard let front = NSWorkspace.shared.frontmostApplication else { return false }
+        if front.processIdentifier == ownPID {
+            return appHasVisibleWindow(pid: ownPID, in: windowList)
+        }
+        guard !blacklist.matches(front),
               appHasVisibleWindow(pid: front.processIdentifier, in: windowList)
         else { return false }
         return true
@@ -723,6 +942,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             }
         }
         updateStatusText()
+        refreshMainStatus()
         if lost {
             log("⚠️ 屏幕录制权限已失效，窗口名不可读，焦点切换已停摆。请到 系统设置 → 隐私与安全性 → 屏幕录制 重新授权", level: .error)
         } else {
@@ -764,8 +984,13 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     }
 
     /// Count one failure for `target`; true while the caller should keep the
-    /// anchor and retry, false once the same target has failed 3 times.
-    private func shouldRetryActivation(target: CGWindowID) -> Bool {
+    /// anchor and retry, false once the same target has failed 3 times within
+    /// the current episode (identified by `anchor`, the vanished window).
+    private func shouldRetryActivation(target: CGWindowID, anchor: CGWindowID) -> Bool {
+        if focusFailureAnchor != anchor {
+            focusFailureAnchor = anchor
+            focusFailures = 0
+        }
         if focusFailureTarget == target {
             focusFailures += 1
         } else {
@@ -783,15 +1008,21 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         // Before macOS 14, a bare activate() often lost to the system's own focus
         // fallback (visible double-switches); macOS 14+ deprecated the flag and
         // changed activate() semantics, where it has no effect anyway.
-        let ok: Bool
+        var ok: Bool
         if #available(macOS 14.0, *) {
             ok = app.activate()
+            if !ok {
+                // macOS 14+ focus-stealing protection rejects activate() from a
+                // background app. Briefly taking activation ourselves turns the
+                // call into a frontmost handoff, which the system allows; the
+                // deprecated ignoringOtherApps variant is still honored here.
+                NSApp.activate(ignoringOtherApps: true)
+                ok = app.activate()
+            }
         } else {
             ok = app.activate(options: [.activateIgnoringOtherApps])
         }
         if !ok {
-            // macOS 15+ focus-stealing protection can reject activate() from a
-            // background app that lacks recent user interaction
             log("⚠️ activate(\(info.name)) 被系统拒绝", level: .error)
         }
         return ok
@@ -802,5 +1033,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
 let app = NSApplication.shared
 let delegate = SmartFocusApp()
 app.delegate = delegate
-app.setActivationPolicy(.accessory)
+// Regular app: Dock icon + main window (Spotlight/Dock reachable); the menu
+// bar item stays as a secondary entry point for when the bar is visible.
+app.setActivationPolicy(.regular)
 app.run()
