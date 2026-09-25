@@ -163,8 +163,17 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private var burstRemaining = 0
     private var isChecking = false
     private var interventionCooldownUntil = Date.distantPast
+    // Consecutive activation failures for one target (window ID, or 0 for the
+    // Finder fallback): after 3 strikes we give up and let the anchor roll
+    // forward, so a permanently rejected activate() cannot retry forever.
+    private var focusFailures = 0
+    private var focusFailureTarget: CGWindowID?
     private let checkQueue = DispatchQueue(label: "com.baikong.smartfocus.check", qos: .userInteractive)
     private var configWatcher: DispatchSourceFileSystemObject?
+    // True right after persistConfig's own write: lets the watcher skip the
+    // self-triggered reload/log (but still re-arm, since the atomic save
+    // replaces the watched inode).
+    private var suppressNextConfigEvent = false
     private var statusMenuItem: NSMenuItem!
     private var debugLogMenuItem: NSMenuItem!
     private var launchAtLoginMenuItem: NSMenuItem!
@@ -274,8 +283,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleDebugLogging() {
-        config.debugLogging.toggle()
-        persistConfig()
+        persistConfig { $0.debugLogging.toggle() }
         applyDebugState()
         log("🐞 调试日志已\(config.debugLogging ? "开启" : "关闭")")
     }
@@ -318,13 +326,22 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         launchAtLoginMenuItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
-    private func persistConfig() {
+    /// Merge a field mutation into the on-disk config before writing. Writing
+    /// the in-memory copy directly would clobber external edits made since
+    /// the last reload; loading first keeps them. Our own write sets the
+    /// suppress flag so the watcher doesn't echo a redundant reload.
+    private func persistConfig(mutating: (inout Config) -> Void) {
+        var merged = Config.load()
+        mutating(&merged)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(config) {
+        if let data = try? encoder.encode(merged) {
             do {
+                suppressNextConfigEvent = true
                 try data.write(to: Config.configURL)
+                config = merged
             } catch {
+                suppressNextConfigEvent = false
                 log("⚠️ 无法写入配置文件: \(error.localizedDescription)", level: .error)
             }
         }
@@ -468,8 +485,12 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         source.setEventHandler { [weak self] in
             guard let self = self else { return }
             let event = self.configWatcher?.data ?? []
-            self.applyConfig()
-            log("🔄 自动检测到配置变更并已应用")
+            if self.suppressNextConfigEvent {
+                self.suppressNextConfigEvent = false
+            } else {
+                self.applyConfig()
+                log("🔄 自动检测到配置变更并已应用")
+            }
             if event.contains(.delete) || event.contains(.rename) {
                 self.watchConfig()
             }
@@ -556,12 +577,25 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                     }
                     if let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first,
                        finder.activate() {
+                        resetFocusFailures()
                         log("🏠 无可用窗口，回落到访达/桌面")
+                    } else if shouldRetryActivation(target: 0) {
+                        keepPreviousAnchor = true
+                    } else {
+                        log("⚠️ 回落访达连续失败，放弃并重置锚点", level: .error)
                     }
                     return
                 }
-                self.doFocus(info)
-                log("🎯 焦点切换 -> \(info.name) (PID: \(info.pid))")
+                if self.doFocus(info) {
+                    resetFocusFailures()
+                    log("🎯 焦点切换 -> \(info.name) (PID: \(info.pid))")
+                } else if shouldRetryActivation(target: info.windowNumber) {
+                    // Keep the disappearance evidence so the next tick retries;
+                    // consuming it here would short-circuit forever (cur == topID).
+                    keepPreviousAnchor = true
+                } else {
+                    log("⚠️ 激活 \(info.name) 连续失败，放弃并重置锚点", level: .error)
+                }
             }
         }
     }
@@ -635,10 +669,29 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    private func doFocus(_ info: (windowNumber: CGWindowID, pid: pid_t, name: String)) {
+    /// Reset the activation-failure streak (any successful intervention, or a
+    /// target change, starts a fresh count).
+    private func resetFocusFailures() {
+        focusFailures = 0
+        focusFailureTarget = nil
+    }
+
+    /// Count one failure for `target`; true while the caller should keep the
+    /// anchor and retry, false once the same target has failed 3 times.
+    private func shouldRetryActivation(target: CGWindowID) -> Bool {
+        if focusFailureTarget == target {
+            focusFailures += 1
+        } else {
+            focusFailureTarget = target
+            focusFailures = 1
+        }
+        return focusFailures < 3
+    }
+
+    private func doFocus(_ info: (windowNumber: CGWindowID, pid: pid_t, name: String)) -> Bool {
         guard let app = NSRunningApplication(processIdentifier: info.pid) else {
             log("⚠️ 目标进程不存在 (PID: \(info.pid))", level: .error)
-            return
+            return false
         }
         // Before macOS 14, a bare activate() often lost to the system's own focus
         // fallback (visible double-switches); macOS 14+ deprecated the flag and
@@ -654,6 +707,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             // background app that lacks recent user interaction
             log("⚠️ activate(\(info.name)) 被系统拒绝", level: .error)
         }
+        return ok
     }
 }
 
