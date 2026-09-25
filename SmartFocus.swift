@@ -438,6 +438,16 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private var suppressNextConfigEvent = false
     private var statusMenuItem: NSMenuItem!
 
+    // A LaunchServices launch (Spotlight / Finder / `open`) delivers an
+    // 'oapp' Apple event; a login-item launch is a bare launchd spawn with
+    // no pending event. Read in applicationWillFinishLaunching — the event
+    // is consumed by the time didFinishLaunching runs.
+    private var launchedByUserAction = false
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        launchedByUserAction = NSAppleEventManager.shared().currentAppleEvent != nil
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         LogRedirector.shared.console = mainWC
 
@@ -464,8 +474,14 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         refreshMainStatus()
 
         tick() // immediate first check: surfaces a missing screen-recording permission right away
-        showMainWindow()
-        log("⚡️ SmartFocus 已启动")
+        if launchedByUserAction {
+            showMainWindow()
+            log("⚡️ SmartFocus 已启动")
+        } else {
+            // Login-item launch: stay hidden; Spotlight / menu bar bring
+            // the window up on demand
+            log("⚡️ SmartFocus 已随登录启动（后台静默运行）")
+        }
     }
 
     /// Spotlight/Dock activation of an already-running app lands here; bring
