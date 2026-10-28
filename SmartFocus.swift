@@ -7,6 +7,7 @@ import ServiceManagement
 // Event ids are reverse-engineered values, verified live by AltTab on macOS 26
 // and shared with yabai's implementation; stable from 10.10 through 26.5.
 typealias CGSConnectionID = UInt32
+typealias CGSSpaceID = UInt64
 
 @_silgen_name("CGSMainConnectionID")
 func CGSMainConnectionID() -> CGSConnectionID
@@ -59,6 +60,12 @@ enum SkyLight {
     static let windowIteratorGetWindowID: (@convention(c) (_ iterator: CFTypeRef) -> CGWindowID)? =
         slsSymbol("SLSWindowIteratorGetWindowID")
 
+    /// Space ids owning the given windows; mask 7 = all spaces (5 = current,
+    /// 6 = other). Empty result = the window is gone from every Space.
+    static let copySpacesForWindows: (@convention(c) (
+        _ cid: CGSConnectionID, _ mask: Int, _ wids: CFArray) -> Unmanaged<CFArray>?)? =
+        slsSymbol("CGSCopySpacesForWindows")
+
     /// Window ids (of `wids`) the WindowServer still lists — minimized and
     /// other-Space windows included, which an on-screen snapshot cannot see.
     /// Runs one batched IPC; blocks while the WindowServer is busy (measured
@@ -87,6 +94,11 @@ enum WSNotification: UInt32, CaseIterable {
     case windowFocused = 808
     case windowOrderedIn = 815
     case windowOrderedOut = 816
+    // Window joined/left a Space (drag across Spaces): no 808 fires — the
+    // window keeps focus through the move — so these are the only signal to
+    // refresh the anchor's cached Space.
+    case windowSpaceWillChange = 1325
+    case windowSpaceDidChange = 1326
     case spaceCurrentChanged = 1329
     case activeSpaceChanged = 1401
 }
@@ -226,6 +238,31 @@ final class WindowServerTap {
         guard !list.isEmpty else { return }
         _ = request(cid, &list, Int32(list.count))
     }
+
+    // MARK: - Space topology (close-guard support)
+
+    /// Every Space owning `wid` (empty when the window belongs to none).
+    /// A window can belong to SEVERAL Spaces (assigned to all desktops, or
+    /// mid-transition), so callers must test membership — reading only the
+    /// first id reports a wrong Space for multi-Space windows.
+    func spaceIDs(ofWindow wid: CGWindowID) -> Set<CGSSpaceID> {
+        guard let spaces = SkyLight.copySpacesForWindows,
+              let raw = spaces(cid, 7, [wid] as CFArray) else { return [] }
+        let arr = raw.takeRetainedValue() as NSArray
+        var ids = Set<CGSSpaceID>()
+        for case let n as NSNumber in arr { ids.insert(n.uint64Value) }
+        return ids
+    }
+
+    /// A single representative Space for `wid` (nil when it belongs to none).
+    /// Prefers `current` when the window spans several Spaces — for caching
+    /// "where is this window", the Space the user is looking at is the
+    /// meaningful one.
+    func spaceID(ofWindow wid: CGWindowID, preferring current: CGSSpaceID? = nil) -> CGSSpaceID? {
+        let ids = spaceIDs(ofWindow: wid)
+        if let current, ids.contains(current) { return current }
+        return ids.first
+    }
 }
 
 // MARK: - 全局日志函数 (替代 print)
@@ -250,6 +287,10 @@ struct Config: Codable {
     var pollInterval: Double = 0.2
     var blacklist: Set<String> = Config.defaultBlacklist
     var debugLogging: Bool = false
+    /// When closing a window whose app still has windows on another Space,
+    /// macOS jumps there; pull focus back to the next window on the Space
+    /// where the close happened. Defaults on.
+    var stayOnSpaceOnClose: Bool = true
 
     static let defaultConfig = Config()
 
@@ -262,6 +303,7 @@ struct Config: Codable {
         pollInterval = try c.decodeIfPresent(Double.self, forKey: .pollInterval) ?? 0.2
         blacklist = try c.decodeIfPresent(Set<String>.self, forKey: .blacklist) ?? Config.defaultBlacklist
         debugLogging = try c.decodeIfPresent(Bool.self, forKey: .debugLogging) ?? false
+        stayOnSpaceOnClose = try c.decodeIfPresent(Bool.self, forKey: .stayOnSpaceOnClose) ?? true
     }
     
     static let configURL: URL = {
@@ -615,7 +657,18 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private var mainWC = MainWindowController()
     
     private var topID: CGWindowID = 0
-    private var menuBarIcon: NSImage?
+    /// App owning the anchor window. When the anchor disappears, "settled on
+    /// the SAME app" is not a good fallback if that app has nothing else on
+    /// the origin Space — that is the closed app holding focus with a leftover
+    /// window, and the user expects the next app instead.
+    private var anchorPID: pid_t = 0
+    /// Space of the anchor window. Primary refresh source: the window's own
+    /// space-membership events (1325/1326, drag across Spaces); quiet ticks
+    /// re-query as a backstop for missed events. The guard must anchor on THE
+    /// WINDOW'S Space, not "current at event time": destroy events can arrive
+    /// after the system's fallback jump already started, by which point
+    /// "current" is the other Space.
+    private var anchorSpaceID: CGSSpaceID?
     private let ownPID = getpid()
     private var config = Config.load()
     private var blacklistMatcher = BlacklistMatcher(entries: [])
@@ -626,6 +679,30 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private var fallbackTimer: Timer?
     private var isChecking = false
     private var interventionCooldownUntil = Date.distantPast
+    /// Close-triggered space-jump guard: closing a window whose app still has
+    /// windows on another Space makes macOS jump there. For a short window
+    /// after an anchor destroy we treat any Space-change event as that jump
+    /// and pull focus back to the next window of the Space where the close
+    /// happened (the candidate is captured by the close-time tick, even when
+    /// cooldown defers the activation itself).
+    private var guardActiveUntil = Date.distantPast
+    private var guardTargetPID: pid_t?
+    /// Space where the guarded close happened; candidates and "settled" apps
+    /// must live on it while the guard is armed.
+    private var guardSpaceID: CGSSpaceID?
+    /// Anchor window the current guard was armed for. A single close can emit
+    /// BOTH 804 and 816 for the same wid (true destroy plus order-out); the
+    /// second event arrives after the fallback jump already started, so
+    /// re-arming on it would overwrite a correct anchor Space with the
+    /// destination Space. One arm per anchor disappearance.
+    private var guardAnchorID: CGWindowID = 0
+    /// App the closed anchor window belonged to, snapshotted at arm time.
+    /// `anchorPID` rolls forward inside tick's defer, so guard code must not
+    /// read it after the tick that consumed the disappearance.
+    private var guardClosedPID: pid_t = 0
+    /// Latest on-screen snapshot, kept for the event handlers that need Space
+    /// context at event time (dominant-Space inference). Written on main.
+    private var lastSnapshot: [[String: Any]]?
     // Consecutive activation failures for one target (window ID, or 0 for the
     // Finder fallback): after 3 strikes we give up and let the anchor roll
     // forward, so a permanently rejected activate() cannot retry forever.
@@ -724,7 +801,6 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             
             // ⚠️ 关键：设置为模板图像，自动适配深浅色模式
             icon?.isTemplate = true
-            menuBarIcon = icon
             button.image = icon
         }
         
@@ -824,11 +900,6 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         } catch {
             log("⚠️ 开机自启动设置失败: \(error.localizedDescription)", level: .error)
         }
-        updateLaunchAtLoginState()
-    }
-
-    private func updateLaunchAtLoginState() {
-        // The menu no longer mirrors this; the main window switch is the UI.
         refreshMainStatus()
     }
 
@@ -895,8 +966,16 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func setupWindowServerTap() {
-        wsTap.onEvent = { [weak self] notification, wid in
+    /// Re-query the tracked window's Space and cache it. Prefers the Space the
+    /// snapshot says is on screen, so a window that belongs to several Spaces
+    /// caches the one the user is actually on.
+    private func refreshAnchorSpace() {
+        guard topID != 0 else { return }
+        let onScreen = lastSnapshot.flatMap { dominantSpace(in: $0) }
+        anchorSpaceID = wsTap.spaceID(ofWindow: topID, preferring: onScreen) ?? anchorSpaceID
+    }
+
+    private func setupWindowServerTap() {        wsTap.onEvent = { [weak self] notification, wid in
             self?.handleWindowServerEvent(notification, wid: wid)
         }
         wsTap.start()
@@ -910,10 +989,44 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             wsTap.subscribe(wid)
             tick()
         case .windowDestroyed, .windowOrderedOut:
-            // Close (804) / minimize or order-out (816) of the tracked window:
-            // check immediately, then once more after the system's own focus
-            // fallback had time to land (or not).
+            // Close (804) / hide-style close or minimize (816) of the tracked
+            // window: check immediately, then once more after the system's own
+            // focus fallback had time to land (or not).
             if wid == topID {
+                // Arm the guard for close AND order-out: hide-style apps
+                // (WeChat and other Electron apps close by hiding the window —
+                // an 816, not an 804) trigger the same cross-Space fallback,
+                // and so can minimize. A single close can emit both events for
+                // this wid; only the FIRST may arm (see guardAnchorID).
+                if config.stayOnSpaceOnClose, guardAnchorID != wid || Date() >= guardActiveUntil {
+                    guardActiveUntil = Date().addingTimeInterval(0.8)
+                    guardAnchorID = wid
+                    guardTargetPID = nil
+                    guardClosedPID = anchorPID != 0 ? anchorPID
+                        : (NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0)
+                    // Anchor on the closed window's OWN Space, cached while it
+                    // was still on screen. Both close styles use it: "current"
+                    // is either the jump destination (804 arriving late) or a
+                    // snapshot majority dominated by another display's windows
+                    // (multi-display: the user's Space had fewer windows).
+                    let snapSpace = lastSnapshot.flatMap { dominantSpace(in: $0) }
+                    guardSpaceID = anchorSpaceID ?? snapSpace
+                    log("🛡️ 关窗守卫武装: space=\(guardSpaceID.map(String.init) ?? "?") (wid: \(wid), cache: \(anchorSpaceID.map(String.init) ?? "nil"), snap: \(snapSpace.map(String.init) ?? "nil"), event: \(n.rawValue))")
+                    capturePreJumpCandidate()
+                    // Vacuum safety net: if the guard expires with the system
+                    // still parked on the Desktop (no fallback landed, no Space
+                    // change ever fired — the 1401 path never ran), land on
+                    // the pre-captured target once. Any other settled app is
+                    // the system's own (better-informed) choice — leave it.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) { [weak self] in
+                        guard let self = self,
+                              Date() >= self.guardActiveUntil,
+                              let target = self.guardTargetPID,
+                              let front = NSWorkspace.shared.frontmostApplication,
+                              front.bundleIdentifier == "com.apple.finder" else { return }
+                        self.switchBackAfterCloseJump(target: target)
+                    }
+                }
                 tick()
                 schedulePostCooldownCheck(after: 0.25)
             }
@@ -926,11 +1039,41 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         case .windowOrderedIn:
             // A window reappearing (un-minimize) can change the z-order candidate
             tick()
+        case .windowSpaceWillChange, .windowSpaceDidChange:
+            // Drag-across-Spaces: the dragged window keeps focus (no 808), so
+            // these are the only signal that its Space moved. The payload's
+            // window id is not reliable for this event family, so refresh
+            // unconditionally from the tracked anchor instead of comparing
+            // `wid == topID` (that comparison silently never matched).
+            // Skip while the close-guard is armed: a hide-style close (816)
+            // fires these for the JUST-HIDDEN window as it leaves its Space,
+            // and the query then returns the hidden window's parking Space.
+            if Date() >= guardActiveUntil {
+                refreshAnchorSpace()
+                tick()
+            }
         case .spaceCurrentChanged, .activeSpaceChanged:
             // Space-switch animation rewrites the on-screen window list
             // wholesale while target windows have not landed yet; wait it out.
             interventionCooldownUntil = Date().addingTimeInterval(0.5)
             schedulePostCooldownCheck(after: 0.5)
+            // A Space change inside the close-guard window is the system's
+            // close fallback jumping to a window on another Space. Only one
+            // kind of jump is unwanted: landing on the CLOSED app itself
+            // (the user wants the next app, not the same one on another
+            // desktop). Landing on a different app is the expected next-window
+            // behaviour — leave it. The delay lets the switch animation start
+            // so our activation lands as a deliberate switch, not a
+            // mid-flight fight.
+            if Date() < guardActiveUntil, let target = guardTargetPID {
+                let closedPID = guardClosedPID
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    guard let self = self,
+                          let front = NSWorkspace.shared.frontmostApplication,
+                          front.processIdentifier == closedPID else { return }
+                    self.switchBackAfterCloseJump(target: target)
+                }
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 self?.tick()
             }
@@ -966,6 +1109,39 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             let delay: TimeInterval = note.name == NSWorkspace.didDeactivateApplicationNotification ? 0.05 : 0
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 self?.tick()
+            }
+        }
+    }
+
+    /// Snapshot + pick the next usable window BEFORE the system's fallback
+    /// jump can rewrite the on-screen list — after the jump the origin Space's
+    /// candidate is unrecoverable from that list. The normal tick races the
+    /// jump (its snapshot can land on either side); this pre-jump scan is the
+    /// deterministic source for the guard target.
+    private func capturePreJumpCandidate() {
+        let blacklist = blacklistMatcher
+        checkQueue.async { [weak self] in
+            guard let self = self,
+                  let list = self.snapshot() else { return }
+            let usable = self.usableWindows(in: list, blacklist: blacklist)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, Date() < self.guardActiveUntil else { return }
+                // Adopt the first usable window ON the origin Space (or with an
+                // unresolvable Space): the z-top can already be the fallback
+                // jump's landing window on the OTHER Space, which must not
+                // become the guard target. Membership, not equality: a window
+                // belonging to several Spaces is valid as long as the origin
+                // Space is one of them.
+                for w in usable where w.pid != self.guardClosedPID {
+                    let spaces = self.wsTap.spaceIDs(ofWindow: w.windowNumber)
+                    if spaces.isEmpty || spaces.contains(self.guardSpaceID ?? 0) {
+                        self.guardTargetPID = w.pid
+                        log("🎯 预捕获原桌面候选 -> \(w.name) (PID: \(w.pid), wid: \(w.windowNumber), spaces: \(spaces.sorted()))")
+                        return
+                    }
+                    log("🎯 预捕获跳过 \(w.name) (spaces: \(spaces.sorted()))")
+                }
+                log("🎯 预捕获：原桌面无可用候选")
             }
         }
     }
@@ -1047,7 +1223,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             let list = self.snapshot()
             self.wsTap.pruneIfNeeded()
-            let cur = list.flatMap { self.firstUsable(in: $0, blacklist: blacklist) }
+            let usable = list.map { self.usableWindows(in: $0, blacklist: blacklist) } ?? []
             let previousID = self.topID
             let previousStillOnScreen = list.map { self.contains($0, previousID) } ?? true
             DispatchQueue.main.async { [weak self] in
@@ -1055,9 +1231,42 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                 defer { self.isChecking = false }
 
                 guard let list = list else { return }
+                self.lastSnapshot = list
+                // Prefer a candidate ON the Space the user is looking at: the
+                // on-screen list's global z-order interleaves other Spaces, and
+                // activating their top window yanks the user to another
+                // desktop. While the close-guard is armed the origin Space is
+                // authoritative; otherwise infer it from the snapshot. Fall
+                // back to the raw z-order only when that Space has nothing
+                // usable (a real vacuum).
+                let currentSpace = (Date() < self.guardActiveUntil ? self.guardSpaceID : nil)
+                    ?? self.dominantSpace(in: list)
+                let sameSpace = usable.first { w in
+                    let spaces = self.wsTap.spaceIDs(ofWindow: w.windowNumber)
+                    return spaces.isEmpty || currentSpace.map(spaces.contains) ?? true
+                }
+                // The anchor is the window the user is working in, i.e. the
+                // frontmost app's window — NOT the snapshot's z-order head,
+                // which routinely belongs to another app (an always-on-top
+                // Chrome window above the DingTalk window being closed used to
+                // make the anchor track Chrome, so the close produced no event
+                // match at all).
+                let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                let cur = (frontPID.flatMap { pid in usable.first { $0.pid == pid } }) ?? sameSpace ?? usable.first
+                // Keep the anchor's cached Space current on EVERY tick, not
+                // only the quiet path: a drag across Spaces may arrive as any
+                // event, and the close that follows must arm on the Space the
+                // window is on NOW.
+                if let cur, Date() >= self.guardActiveUntil {
+                    self.anchorSpaceID = self.wsTap.spaceID(ofWindow: cur.windowNumber, preferring: currentSpace) ?? self.anchorSpaceID
+                }
                 // Re-align the per-window subscription with reality; the
                 // snapshot is the only source of current layer-0 window ids.
                 wsTap.subscribe(layer0WindowIDs(in: list))
+                if cur?.windowNumber == previousID, previousID != 0, Date() >= self.guardActiveUntil {
+                    self.anchorPID = cur?.pid ?? self.anchorPID
+                    return
+                }
                 guard cur?.windowNumber != previousID else { return }
 
                 let nextID = cur?.windowNumber ?? 0
@@ -1068,13 +1277,31 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                 // short-circuit forever — the vacuum never gets fixed.
                 var keepPreviousAnchor = false
                 defer {
-                    if !keepPreviousAnchor { self.topID = nextID }
+                    if !keepPreviousAnchor {
+                        self.topID = nextID
+                        // A just-created window's Space membership may not be
+                        // queryable yet (creation race): keep the last known
+                        // Space instead of nil — the arm-time fallback to
+                        // "current" is poisoned when the destroy event arrives
+                        // after the fallback jump already started.
+                        self.anchorSpaceID = nextID == 0 ? nil : (self.wsTap.spaceID(ofWindow: nextID, preferring: currentSpace) ?? self.anchorSpaceID)
+                        self.anchorPID = nextID == 0 ? 0 : (cur?.pid ?? 0)
+                    }
                 }
 
                 guard previousID != 0, !previousStillOnScreen else { return }
 
-                // The tracked window just disappeared (close event)
-                if self.systemSettledOnUsableApp(blacklist: blacklist, windowList: list) {
+                // The tracked window just disappeared (close event).
+                // Guard scope is narrow: what we undo is the system jumping to
+                // the CLOSED app's own window on another Space (close a WeChat
+                // window on B, app has windows on A, macOS yanks you to A).
+                // A fallback to a DIFFERENT app on another Space is the user's
+                // expected next-window behaviour — never fight it.
+                let guardSpace = Date() < self.guardActiveUntil ? self.guardSpaceID : nil
+                if self.systemSettledOnUsableApp(blacklist: blacklist,
+                                                 windowList: list,
+                                                 guardSpace: guardSpace,
+                                                 closedPID: guardSpace != nil ? self.guardClosedPID : 0) {
                     log("✅ 系统已自行回落焦点，跳过干预")
                     return
                 }
@@ -1108,9 +1335,31 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                     }
                     return
                 }
+                // Guard the one case above: if the tick's candidate lives on
+                // another Space, that is the fallback jump's landing window —
+                // pull back to the pre-jump candidate instead. Same-Space
+                // candidates are taken as-is.
+                if Date() < self.guardActiveUntil,
+                   let origin = self.guardSpaceID,
+                   !self.wsTap.spaceIDs(ofWindow: info.windowNumber).contains(origin),
+                   let target = self.guardTargetPID {
+                    keepPreviousAnchor = true
+                    log("🛡️ 拒绝跨桌面候选 \(info.name)，拉回原桌面")
+                    self.switchBackAfterCloseJump(target: target)
+                    return
+                }
                 if self.doFocus(info) {
                     resetFocusFailures()
                     log("🎯 焦点切换 -> \(info.name) (PID: \(info.pid))")
+                    // Verify the activation actually landed: focus-stealing
+                    // protection can make activate() return true while the
+                    // system keeps the previous app frontmost.
+                    let expectedPID = info.pid
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        let front = NSWorkspace.shared.frontmostApplication
+                        let ok = front?.processIdentifier == expectedPID
+                        log("🔍 聚焦校验: 前台=\(front?.localizedName ?? "?") (期望 \(info.name)) \(ok ? "✅" : "❌")", level: ok ? .debug : .error)
+                    }
                 } else if shouldRetryActivation(target: info.windowNumber, anchor: previousID) {
                     // Keep the disappearance evidence so the next tick retries;
                     // consuming it here would short-circuit forever (cur == topID).
@@ -1129,7 +1378,18 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     /// vacuum this tool exists to fix. Ourselves: settled only while our own
     /// window is on screen — the user is deliberately in our panel, and a
     /// background window closing behind it is not a vacuum to fix.
-    private func systemSettledOnUsableApp(blacklist: BlacklistMatcher, windowList: [[String: Any]]) -> Bool {
+    /// `requireSpace`: when set (close-guard active), a settled frontmost whose
+    /// visible window lives on ANOTHER Space is the close-fallback jump, not a
+    /// resolution — report not-settled so the guard can act.
+    /// `excluding`: a pid that must not count as settled (the app whose window
+    /// just closed — focus on its leftover window is not the next app).
+    /// `guardSpace` + `closedPID`: while the close-guard is armed, focus that
+    /// landed on the CLOSED app's own window on ANOTHER Space is the fallback
+    /// jump we undo — report not-settled. Focus on any other app, on any
+    /// Space, is the user's expected next-window behaviour: settled.
+    private func systemSettledOnUsableApp(blacklist: BlacklistMatcher, windowList: [[String: Any]],
+                                          guardSpace: CGSSpaceID? = nil,
+                                          closedPID: pid_t = 0) -> Bool {
         guard let front = NSWorkspace.shared.frontmostApplication else { return false }
         if front.processIdentifier == ownPID {
             return appHasVisibleWindow(pid: ownPID, in: windowList)
@@ -1137,6 +1397,17 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         guard !blacklist.matches(front),
               appHasVisibleWindow(pid: front.processIdentifier, in: windowList)
         else { return false }
+        if let guardSpace, closedPID != 0,
+           let wid = windowList.first(where: {
+               ($0[kCGWindowOwnerPID as String] as? pid_t) == front.processIdentifier &&
+               ($0[kCGWindowLayer as String] as? Int) == 0
+           })?[kCGWindowNumber as String] as? CGWindowID,
+           !wsTap.spaceIDs(ofWindow: wid).contains(guardSpace) {
+            // Focus (whichever app) landed on a window that does not live on
+            // the Space where the close happened — that is the fallback jump,
+            // not a resolution. The user's rule is to stay on the close Space.
+            return false
+        }
         return true
     }
 
@@ -1146,9 +1417,6 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             ($0[kCGWindowLayer as String] as? Int) == 0
         }
     }
-
-    /// Flip the menu bar icon (reserved for future states); logs on
-    /// transitions so bursts don't spam the console.
 
     private func snapshot() -> [[String: Any]]? {
         CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
@@ -1171,7 +1439,22 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         list.contains { ($0[kCGWindowNumber as String] as? CGWindowID) == id }
     }
 
-    private func firstUsable(in list: [[String: Any]], blacklist: BlacklistMatcher) -> (windowNumber: CGWindowID, pid: pid_t, name: String)? {
+    /// The Space the user is actually looking at, inferred from the on-screen
+    /// snapshot: an on-screen list is dominated by the active Space, so the
+    /// most common Space among its layer-0 windows is a safer answer than
+    /// CGSManagedDisplayGetCurrentSpace (which follows the active menu-bar
+    /// display and returns a foreign Space on multi-display setups).
+    private func dominantSpace(in list: [[String: Any]]) -> CGSSpaceID? {
+        var counts: [CGSSpaceID: Int] = [:]
+        for w in list where (w[kCGWindowLayer as String] as? Int) == 0 {
+            guard let id = w[kCGWindowNumber as String] as? CGWindowID else { continue }
+            for space in wsTap.spaceIDs(ofWindow: id) { counts[space, default: 0] += 1 }
+        }
+        return counts.max { $0.value < $1.value }?.key
+    }
+
+    private func usableWindows(in list: [[String: Any]], blacklist: BlacklistMatcher) -> [(windowNumber: CGWindowID, pid: pid_t, name: String)] {
+        var result: [(windowNumber: CGWindowID, pid: pid_t, name: String)] = []
         for w in list {
             guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
                   let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != ownPID,
@@ -1189,9 +1472,20 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                   let frame = w[kCGWindowBounds as String].flatMap({ CGRect(dictionaryRepresentation: $0 as! CFDictionary) }),
                   frame.width >= 120, frame.height >= 120
             else { continue }
-            return (id, pid, app.localizedName ?? "PID \(pid)")
+            result.append((id, pid, app.localizedName ?? "PID \(pid)"))
         }
-        return nil
+        return result
+    }
+
+    /// Re-focus the window captured at close time, undoing the system's
+    /// close-fallback jump to another Space. One shot: the guard is disarmed
+    /// before activating so the resulting Space-change event cannot re-trigger.
+    private func switchBackAfterCloseJump(target pid: pid_t) {
+        guardActiveUntil = Date.distantPast
+        guardTargetPID = nil
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return }
+        log("↩️ 关窗引发跨桌面跳转，拉回原桌面 -> \(app.localizedName ?? "PID \(pid)")")
+        _ = doFocus((windowNumber: 0, pid: pid, name: app.localizedName ?? "PID \(pid)"))
     }
 
     /// Reset the activation-failure streak (any successful intervention, or a

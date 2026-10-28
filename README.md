@@ -7,6 +7,7 @@ macOS sometimes drops focus to the Desktop/Finder after you close a window. Smar
 ## Features
 
 - **Focus restoration** on window close (Cmd+W), with minimal interference: if macOS already falls back to a usable app, SmartFocus accepts it and does nothing
+- **Stays on your Space**: closing a window whose app still has windows on another Space would normally yank macOS there — SmartFocus pulls focus back to the next window on the Space where you closed it (disable via `stayOnSpaceOnClose: false`; a deliberate manual Space switch within 0.8s of a close may be pulled back once)
 - **Event-driven, no polling**: a WindowServer notify-proc tap (SkyLight private API — the AltTab/yabai mechanism) delivers window create/destroy/order/focus and Space-switch events the instant they happen; `NSWorkspace` notifications remain as a redundant trigger, and a 5s fallback timer only self-heals (missed events, permission watchdog, subscription re-sync)
 - **Hot-reloaded config** at `~/.smartfocus/config.json` (app blacklist, debug logging), survives atomic saves
 - Built-in **log console** with debug/error levels (errors only, unless debug logging is on)
@@ -40,7 +41,8 @@ Note: with ad-hoc signing, re-building invalidates the registered login item —
 ```json
 {
   "blacklist": ["com.apple.dock", "com.apple.systemuiserver", "com.apple.loginwindow", "WindowServer"],
-  "debugLogging": false
+  "debugLogging": false,
+  "stayOnSpaceOnClose": true
 }
 ```
 
