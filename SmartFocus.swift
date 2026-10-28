@@ -42,6 +42,42 @@ enum SkyLight {
         _ cid: CGSConnectionID, _ proc: CGSConnectionNotifyProc,
         _ event: UInt32, _ context: UnsafeMutableRawPointer?) -> CGError)? =
         slsSymbol("SLSRegisterConnectionNotifyProc")
+
+    // Batched window query (one IPC for a whole wid set; the iterator getters
+    // read the local snapshot). See WindowServerTap.pruneIfNeeded.
+    static let windowQueryWindows: (@convention(c) (
+        _ cid: CGSConnectionID, _ windows: CFArray, _ options: Int32) -> Unmanaged<CFTypeRef>)? =
+        slsSymbol("SLSWindowQueryWindows")
+
+    static let windowQueryResultCopyWindows: (@convention(c) (
+        _ query: CFTypeRef) -> Unmanaged<CFTypeRef>)? =
+        slsSymbol("SLSWindowQueryResultCopyWindows")
+
+    static let windowIteratorAdvance: (@convention(c) (_ iterator: CFTypeRef) -> Bool)? =
+        slsSymbol("SLSWindowIteratorAdvance")
+
+    static let windowIteratorGetWindowID: (@convention(c) (_ iterator: CFTypeRef) -> CGWindowID)? =
+        slsSymbol("SLSWindowIteratorGetWindowID")
+
+    /// Window ids (of `wids`) the WindowServer still lists — minimized and
+    /// other-Space windows included, which an on-screen snapshot cannot see.
+    /// Runs one batched IPC; blocks while the WindowServer is busy (measured
+    /// ~27ms during a Space transition), so callers must run it off-main.
+    static func existingWindowIDs(_ wids: [CGWindowID]) -> Set<CGWindowID>? {
+        guard let query = windowQueryWindows,
+              let copyResult = windowQueryResultCopyWindows,
+              let advance = windowIteratorAdvance,
+              let getWindowID = windowIteratorGetWindowID,
+              !wids.isEmpty else { return nil }
+        let result = query(CGSMainConnectionID(), wids as CFArray, 0).takeRetainedValue()
+        let iterator = copyResult(result).takeRetainedValue()
+        var ids = Set<CGWindowID>()
+        ids.reserveCapacity(wids.count)
+        while advance(iterator) {
+            ids.insert(getWindowID(iterator))
+        }
+        return ids
+    }
 }
 
 /// The WindowServer notifications SmartFocus acts on (raw ids, see above).
@@ -71,9 +107,16 @@ final class WindowServerTap {
     /// Per-window events (destroy/focus/order) only arrive for subscribed
     /// windows. Grows without snapshot-based pruning: the on-screen snapshot
     /// cannot see other-Space windows, so pruning by snapshot would deafen us
-    /// to them. Only a confirmed destroy (804) removes a wid; bounded by the
-    /// session's layer-0 window count — trivial.
+    /// to them. `pruneIfNeeded` reconciles against an all-window query instead;
+    /// only a confirmed destroy (804) removes a wid immediately.
     private var subscribed = Set<CGWindowID>()
+    /// Subscribe time per wid: wids younger than 30s are exempt from pruning —
+    /// a window created a beat ago may not appear in the query result yet.
+    private var subscribedAt = [CGWindowID: Date]()
+    /// Prunes run at most once per 60s; written on main only.
+    private var lastPruneAt = Date.distantPast
+    /// The all-window query blocks while the WindowServer is busy — never main.
+    private let pruneQueue = DispatchQueue(label: "com.baikong.smartfocus.prune", qos: .utility)
     private var requestPending = false
 
     /// Non-capturing C callback (required by @convention(c)); reaches the
@@ -107,6 +150,7 @@ final class WindowServerTap {
     private func deliver(_ n: WSNotification, _ wid: CGWindowID) {
         if n == .windowDestroyed {
             subscribed.remove(wid)
+            subscribedAt.removeValue(forKey: wid)
             scheduleRequest()
         }
         onEvent?(n, wid)
@@ -115,13 +159,55 @@ final class WindowServerTap {
     /// Bulk subscribe from a window snapshot; coalesced to one request per
     /// main-runloop tick so a scan adds many windows with one call.
     func subscribe(_ wids: Set<CGWindowID>) {
-        guard !wids.isSubset(of: subscribed) else { return }
-        subscribed.formUnion(wids)
+        let fresh = wids.subtracting(subscribed)
+        guard !fresh.isEmpty else { return }
+        subscribed.formUnion(fresh)
+        let now = Date()
+        for wid in fresh { subscribedAt[wid] = now }
         scheduleRequest()
     }
 
     func subscribe(_ wid: CGWindowID) {
         guard subscribed.insert(wid).inserted else { return }
+        subscribedAt[wid] = Date()
+        scheduleRequest()
+    }
+
+    /// Periodically drop wids the WindowServer no longer lists. Apps that
+    /// retain their CGWindow close without a 804, and blind 811 subscriptions
+    /// add transient animation windows — without pruning the watch list is the
+    /// session's HISTORY, not its current windows. The all-window query sees
+    /// minimized and other-Space windows, so it is the only safe source.
+    /// Entry from the check queue; state lives on main, only the query runs
+    /// off-main.
+    func pruneIfNeeded() {
+        guard isActive else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self,
+                  Date().timeIntervalSince(self.lastPruneAt) >= 60 else { return }
+            self.lastPruneAt = Date()
+            let now = Date()
+            let candidates = Set(self.subscribedAt.filter { _, at in
+                now.timeIntervalSince(at) >= 30
+            }.keys)
+            guard !candidates.isEmpty else { return }
+            self.pruneQueue.async { [weak self] in
+                guard let existing = SkyLight.existingWindowIDs(Array(candidates)) else { return }
+                DispatchQueue.main.async { [weak self] in
+                    self?.applyPrune(candidates: candidates, existing: existing)
+                }
+            }
+        }
+    }
+
+    private func applyPrune(candidates: Set<CGWindowID>, existing: Set<CGWindowID>) {
+        let stale = candidates.subtracting(existing)
+        guard !stale.isEmpty else { return }
+        for wid in stale {
+            subscribed.remove(wid)
+            subscribedAt.removeValue(forKey: wid)
+        }
+        log("🧹 修剪 \(stale.count) 个失效窗口订阅（剩 \(subscribed.count)）")
         scheduleRequest()
     }
 
@@ -282,7 +368,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let maxLogChars = 200_000
 
     private var statusLabel: NSTextField!
-    private var permissionButton: NSButton!
     private var infoLabel: NSTextField!
     private var debugSwitch: NSSwitch!
     private var loginSwitch: NSSwitch!
@@ -292,7 +377,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var onToggleLaunchAtLogin: (() -> Void)?
     var onReloadConfig: (() -> Void)?
     var onOpenConfigFile: (() -> Void)?
-    var onOpenPermissionSettings: (() -> Void)?
     var onClearLog: (() -> Void)?
     var onQuit: (() -> Void)?
 
@@ -320,14 +404,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         statusLabel = NSTextField(labelWithString: "● 运行中")
         statusLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         statusLabel.textColor = .systemGreen
-
-        // Only relevant while the permission is actually lost; refresh()
-        // toggles visibility next to the status line.
-        permissionButton = NSButton(title: "屏幕录制权限设置", target: self, action: #selector(buttonClicked(_:)))
-        permissionButton.bezelStyle = .rounded
-        permissionButton.identifier = NSUserInterfaceItemIdentifier("permission")
-        permissionButton.controlSize = .small
-        permissionButton.isHidden = true
 
         infoLabel = NSTextField(labelWithString: "")
         infoLabel.font = .systemFont(ofSize: 11)
@@ -369,14 +445,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         logTextView.frame = logScroll.contentView.bounds
         logTextView.autoresizingMask = [.width, .height]
 
-        // Status line with the permission-recovery button to its right,
-        // shown only while the permission is lost
-        let statusRow = NSStackView()
-        statusRow.orientation = .horizontal
-        statusRow.spacing = 8
-        statusRow.addArrangedSubview(statusLabel)
-        statusRow.addArrangedSubview(permissionButton)
-
         let buttons = NSStackView(views: [reloadButton, configButton])
         buttons.orientation = .horizontal
         buttons.spacing = 8
@@ -386,7 +454,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         controls.alignment = .leading
         controls.spacing = 10
         controls.translatesAutoresizingMaskIntoConstraints = false
-        controls.addArrangedSubview(statusRow)
+        controls.addArrangedSubview(statusLabel)
         controls.addArrangedSubview(infoLabel)
         controls.addArrangedSubview(makeSeparator())
         controls.addArrangedSubview(makeRow("调试日志", control: debugSwitch))
@@ -476,20 +544,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         switch sender.identifier?.rawValue {
         case "reload": onReloadConfig?()
         case "openConfig": onOpenConfigFile?()
-        case "permission": onOpenPermissionSettings?()
         case "clearLog": onClearLog?()
         case "quit": onQuit?()
         default: break
         }
     }
 
-    /// Sync the panel with app state; call after any config/permission change.
-    func refresh(permissionLost: Bool, blacklistCount: Int,
+    /// Sync the panel with app state; call after any config change.
+    func refresh(blacklistCount: Int,
                  version: String, debugEnabled: Bool, launchAtLogin: Bool?) {
-        statusLabel.stringValue = permissionLost ? "⚠️ 屏幕录制权限已失效" : "● 运行中"
-        statusLabel.textColor = permissionLost ? .systemRed : .systemGreen
-        // The recovery button only exists while recovery is needed
-        permissionButton.isHidden = !permissionLost
+        statusLabel.stringValue = "● 运行中"
         infoLabel.stringValue = "事件驱动 · 黑名单 \(blacklistCount) 项 · v\(version)"
         debugSwitch.state = debugEnabled ? .on : .off
         if let launchAtLogin {
@@ -551,7 +615,6 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private var mainWC = MainWindowController()
     
     private var topID: CGWindowID = 0
-    private var screenPermissionLost = false
     private var menuBarIcon: NSImage?
     private let ownPID = getpid()
     private var config = Config.load()
@@ -610,12 +673,10 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         mainWC.onToggleLaunchAtLogin = { [weak self] in self?.toggleLaunchAtLogin() }
         mainWC.onReloadConfig = { [weak self] in self?.reloadConfig() }
         mainWC.onOpenConfigFile = { [weak self] in self?.openConfigFile() }
-        mainWC.onOpenPermissionSettings = { [weak self] in self?.openScreenRecordingSettings() }
         mainWC.onClearLog = { [weak self] in self?.clearLog() }
         mainWC.onQuit = { [weak self] in self?.quitApp() }
         refreshMainStatus()
-
-        tick() // immediate first check: surfaces a missing screen-recording permission right away
+        tick() // immediate first check: sets the initial anchor and subscriptions
         if launchedByUserAction {
             showMainWindow()
             log("⚡️ SmartFocus 已启动")
@@ -718,11 +779,10 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
-        mainWC.refresh(permissionLost: screenPermissionLost,
-                        blacklistCount: config.blacklist.count,
-                        version: version,
-                        debugEnabled: config.debugLogging,
-                        launchAtLogin: launchAtLogin)
+        mainWC.refresh(blacklistCount: config.blacklist.count,
+                       version: version,
+                       debugEnabled: config.debugLogging,
+                       launchAtLogin: launchAtLogin)
     }
     
     @objc private func reloadConfig() {
@@ -799,23 +859,12 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(Config.configURL)
     }
 
-    /// Deep-link to the Screen Recording pane: the tool is dead without that
-    /// permission, so recovery should be one click from the menu bar.
-    @objc private func openScreenRecordingSettings() {
-        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
-        if !NSWorkspace.shared.open(url) {
-            log("⚠️ 无法打开系统设置的屏幕录制页", level: .error)
-        }
-    }
-    
     @objc private func quitApp() {
         NSApplication.shared.terminate(nil)
     }
     
     private func updateStatusText() {
-        statusMenuItem.title = screenPermissionLost
-            ? "⚠️ 屏幕录制权限已失效，焦点切换停摆"
-            : "✅ 运行中 | 事件驱动 | 黑名单: \(config.blacklist.count)项"
+        statusMenuItem.title = "✅ 运行中 | 事件驱动 | 黑名单: \(config.blacklist.count)项"
     }
 
     private func startFallbackTimer() {
@@ -997,22 +1046,13 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         checkQueue.async { [weak self] in
             guard let self = self else { return }
             let list = self.snapshot()
+            self.wsTap.pruneIfNeeded()
             let cur = list.flatMap { self.firstUsable(in: $0, blacklist: blacklist) }
             let previousID = self.topID
             let previousStillOnScreen = list.map { self.contains($0, previousID) } ?? true
-            // Screen-recording permission lost: the list still comes back, but
-            // every owner name is stripped (system windows always carry names
-            // when permission is granted, so all-empty cannot be a false alarm)
-            let permissionLost = list.map { l in
-                !l.isEmpty && l.allSatisfy { (($0[kCGWindowOwnerName as String] as? String) ?? "").isEmpty }
-            } ?? false
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 defer { self.isChecking = false }
-
-                if permissionLost != self.screenPermissionLost {
-                    self.setPermissionWarning(permissionLost)
-                }
 
                 guard let list = list else { return }
                 // Re-align the per-window subscription with reality; the
@@ -1107,27 +1147,8 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Flip the menu bar into (out of) the permission-lost state; logs only on
-    /// state transitions so bursts don't spam the console.
-    private func setPermissionWarning(_ lost: Bool) {
-        screenPermissionLost = lost
-        if let button = statusItem.button {
-            if lost {
-                button.image = nil
-                button.title = "⚠️"
-            } else {
-                button.title = ""
-                button.image = menuBarIcon
-            }
-        }
-        updateStatusText()
-        refreshMainStatus()
-        if lost {
-            log("⚠️ 屏幕录制权限已失效，窗口名不可读，焦点切换已停摆。请到 系统设置 → 隐私与安全性 → 屏幕录制 重新授权", level: .error)
-        } else {
-            log("✅ 屏幕录制权限已恢复")
-        }
-    }
+    /// Flip the menu bar icon (reserved for future states); logs on
+    /// transitions so bursts don't spam the console.
 
     private func snapshot() -> [[String: Any]]? {
         CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
@@ -1154,16 +1175,21 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         for w in list {
             guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
                   let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != ownPID,
-                  let name = w[kCGWindowOwnerName as String] as? String, !name.isEmpty,
                   let id = w[kCGWindowNumber as String] as? CGWindowID,
-                  !blacklist.matches(name: name, pid: pid),
+                  // TCC strips owner NAMES without Screen Recording but leaves
+                  // the list itself (pids, layer, bounds) intact — so resolve the
+                  // app from the pid and skip anything NSRunningApplication
+                  // cannot see (root/system processes: no activate() possible
+                  // anyway). Side effect: no Screen Recording permission needed.
+                  let app = NSRunningApplication(processIdentifier: pid),
+                  !blacklist.matches(name: app.localizedName, pid: pid, bundleIdentifier: app.bundleIdentifier),
                   // Skip tiny floating panels/widgets (BetterDisplay HUDs, status
                   // panels...): they are layer-0 windows but worthless as a
                   // focus-restore target — landing on one feels like nothing happened
                   let frame = w[kCGWindowBounds as String].flatMap({ CGRect(dictionaryRepresentation: $0 as! CFDictionary) }),
                   frame.width >= 120, frame.height >= 120
             else { continue }
-            return (id, pid, name)
+            return (id, pid, app.localizedName ?? "PID \(pid)")
         }
         return nil
     }

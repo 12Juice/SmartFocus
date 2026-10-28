@@ -11,7 +11,7 @@ macOS sometimes drops focus to the Desktop/Finder after you close a window. Smar
 - **Hot-reloaded config** at `~/.smartfocus/config.json` (app blacklist, debug logging), survives atomic saves
 - Built-in **log console** with debug/error levels (errors only, unless debug logging is on)
 - **Launch at login** (macOS 13+ via `SMAppService`)
-- **Screen-recording permission watchdog**: menu bar turns into ⚠️ when the permission is lost, with recovery detection
+- **No permissions needed**: window matching runs off pids (TCC only strips owner *names* from the window list, not the list itself), so there is no Screen Recording prompt and nothing to re-grant after upgrades
 
 ## Build & Package
 
@@ -21,7 +21,7 @@ macOS sometimes drops focus to the Desktop/Finder after you close a window. Smar
                     # (drag-to-install layout with an /Applications symlink)
 ```
 
-Requires Xcode Command Line Tools. Grant **Screen Recording** permission (System Settings → Privacy & Security) on first launch.
+Requires Xcode Command Line Tools.
 
 ## Install
 
@@ -31,7 +31,7 @@ Open the DMG and drag SmartFocus to Applications — or directly:
 cp -R build/SmartFocus.app /Applications/
 ```
 
-Note: with ad-hoc signing, re-building invalidates the registered login item and TCC grants — re-toggle them after upgrading, or sign with a stable local certificate. The DMG is not notarized (no Developer ID certificate); on other machines Gatekeeper will challenge it — right-click → Open, then confirm.
+Note: with ad-hoc signing, re-building invalidates the registered login item — re-toggle it after upgrading, or sign with a stable local certificate. The DMG is not notarized (no Developer ID certificate); on other machines Gatekeeper will challenge it — right-click → Open, then confirm.
 
 ## Config
 

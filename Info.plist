@@ -9,9 +9,9 @@
 	<key>CFBundleIdentifier</key>
 	<string>com.baikong.smartfocus</string>
 	<key>CFBundleVersion</key>
-	<string>7</string>
+	<string>8</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.0.0</string>
+	<string>2.1.0</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleExecutable</key>
@@ -29,8 +29,5 @@
 	<true/>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
-	<!-- CGWindowListCopyWindowInfo requires Screen Recording permission (TCC) -->
-	<key>NSScreenCaptureUsageDescription</key>
-	<string>SmartFocus reads the on-screen window list to restore focus when the frontmost window closes.</string>
 </dict>
 </plist>
