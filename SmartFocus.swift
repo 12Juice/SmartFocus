@@ -1,6 +1,146 @@
 import Cocoa
 import CoreGraphics
+import Darwin
 import ServiceManagement
+
+// MARK: - SkyLight WindowServer 事件流（私有 API，AltTab/yabai 同款机制）
+// Event ids are reverse-engineered values, verified live by AltTab on macOS 26
+// and shared with yabai's implementation; stable from 10.10 through 26.5.
+typealias CGSConnectionID = UInt32
+
+@_silgen_name("CGSMainConnectionID")
+func CGSMainConnectionID() -> CGSConnectionID
+
+/// Per-connection notification callback:
+/// (event id, payload, payload length, context, connection id)
+typealias CGSConnectionNotifyProc = @convention(c) (
+    _ event: UInt32, _ data: UnsafeMutableRawPointer?, _ dataLength: Int,
+    _ context: UnsafeMutableRawPointer?, _ cid: CGSConnectionID) -> Void
+
+private func slsSymbol<T>(_ name: String) -> T? {
+    guard let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY),
+          let sym = dlsym(handle, name) else { return nil }
+    return unsafeBitCast(sym, to: T.self)
+}
+
+/// The SLS* symbols live in the SkyLight private framework and are not
+/// re-exported by any public one, and a CLI swiftc build cannot link SkyLight
+/// from the SDK — resolve them at runtime via dlopen/dlsym (AltTab's recipe).
+/// Nil if a future macOS drops them: the app degrades to timer-driven checks
+/// instead of crashing.
+enum SkyLight {
+    /// Opt the connection into per-window notifications. REPLACES the
+    /// connection's watch list — it does not add to it; always pass the full
+    /// set (a delta call silences every previously watched window, measured
+    /// by AltTab on macOS 26). There is no unsubscribe symbol; dropping a wid
+    /// from the next call is the only way out.
+    static let requestNotificationsForWindows: (@convention(c) (
+        _ cid: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>,
+        _ windowCount: Int32) -> CGError)? = slsSymbol("SLSRequestNotificationsForWindows")
+
+    static let registerConnectionNotifyProc: (@convention(c) (
+        _ cid: CGSConnectionID, _ proc: CGSConnectionNotifyProc,
+        _ event: UInt32, _ context: UnsafeMutableRawPointer?) -> CGError)? =
+        slsSymbol("SLSRegisterConnectionNotifyProc")
+}
+
+/// The WindowServer notifications SmartFocus acts on (raw ids, see above).
+enum WSNotification: UInt32, CaseIterable {
+    case windowCreated = 811
+    case windowDestroyed = 804
+    case windowFocused = 808
+    case windowOrderedIn = 815
+    case windowOrderedOut = 816
+    case spaceCurrentChanged = 1329
+    case activeSpaceChanged = 1401
+}
+
+/// Bridges the WindowServer notify-proc stream into main-queue callbacks.
+/// The C callback fires on whichever thread snarfs the WindowServer datagram
+/// (often _NSEventThread) with a payload pointer valid only for that call, so
+/// it extracts the integers synchronously and hops to main itself. Do NOT call
+/// SLSConnectionDispatchNotificationsToMainQueueIfNotMainThread on this shared
+/// connection: it displaces AppKit's own coordinated-notification routing and
+/// crashes its main-thread-only handlers (lesson from AltTab).
+final class WindowServerTap {
+    static private(set) var shared: WindowServerTap?
+
+    var onEvent: ((WSNotification, CGWindowID) -> Void)?
+
+    private let cid = CGSMainConnectionID()
+    /// Per-window events (destroy/focus/order) only arrive for subscribed
+    /// windows. Grows without snapshot-based pruning: the on-screen snapshot
+    /// cannot see other-Space windows, so pruning by snapshot would deafen us
+    /// to them. Only a confirmed destroy (804) removes a wid; bounded by the
+    /// session's layer-0 window count — trivial.
+    private var subscribed = Set<CGWindowID>()
+    private var requestPending = false
+
+    /// Non-capturing C callback (required by @convention(c)); reaches the
+    /// instance through the static singleton.
+    private let notifyProc: CGSConnectionNotifyProc = { event, data, len, _, _ in
+        var wid: CGWindowID = 0
+        if let data, len >= 4 { memcpy(&wid, data, 4) }
+        guard let n = WSNotification(rawValue: event) else { return }
+        DispatchQueue.main.async {
+            WindowServerTap.shared?.deliver(n, wid)
+        }
+    }
+
+    /// True once the notify procs are registered; the app checks this to pick
+    /// its fallback cadence (fast timer when the tap is unavailable).
+    private(set) var isActive = false
+
+    func start() {
+        WindowServerTap.shared = self
+        guard let register = SkyLight.registerConnectionNotifyProc else {
+            log("⚠️ SkyLight 符号不可用，事件流降级为兜底轮询", level: .error)
+            return
+        }
+        for n in WSNotification.allCases {
+            _ = register(cid, notifyProc, n.rawValue, nil)
+        }
+        isActive = true
+        log("🔌 WindowServer 事件流已接入 (cid: \(cid))")
+    }
+
+    private func deliver(_ n: WSNotification, _ wid: CGWindowID) {
+        if n == .windowDestroyed {
+            subscribed.remove(wid)
+            scheduleRequest()
+        }
+        onEvent?(n, wid)
+    }
+
+    /// Bulk subscribe from a window snapshot; coalesced to one request per
+    /// main-runloop tick so a scan adds many windows with one call.
+    func subscribe(_ wids: Set<CGWindowID>) {
+        guard !wids.isSubset(of: subscribed) else { return }
+        subscribed.formUnion(wids)
+        scheduleRequest()
+    }
+
+    func subscribe(_ wid: CGWindowID) {
+        guard subscribed.insert(wid).inserted else { return }
+        scheduleRequest()
+    }
+
+    private func scheduleRequest() {
+        guard !requestPending else { return }
+        requestPending = true
+        DispatchQueue.main.async { [weak self] in
+            self?.requestPending = false
+            self?.requestNotifications()
+        }
+    }
+
+    private func requestNotifications() {
+        guard let request = SkyLight.requestNotificationsForWindows else { return }
+        var list = Array(subscribed)
+        guard !list.isEmpty else { return }
+        _ = request(cid, &list, Int32(list.count))
+    }
+}
 
 // MARK: - 全局日志函数 (替代 print)
 enum LogLevel {
@@ -19,6 +159,8 @@ struct Config: Codable {
     // because it is a root process NSRunningApplication cannot resolve.
     static let defaultBlacklist: Set<String> = ["com.apple.dock", "com.apple.systemuiserver", "com.apple.loginwindow", "WindowServer"]
 
+    /// Deprecated: unused since detection became WindowServer-event-driven
+    /// (5s fixed fallback timer). Kept so older config files still decode.
     var pollInterval: Double = 0.2
     var blacklist: Set<String> = Config.defaultBlacklist
     var debugLogging: Bool = false
@@ -71,12 +213,9 @@ struct Config: Codable {
     
     static func load() -> Config {
         guard let data = try? Data(contentsOf: configURL),
-              var config = try? JSONDecoder().decode(Config.self, from: data) else {
+              let config = try? JSONDecoder().decode(Config.self, from: data) else {
             return defaultConfig
         }
-        // Enforce a floor: real-time reaction is handled by workspace events,
-        // the timer is only a fallback, so ultra-small intervals are pointless.
-        config.pollInterval = max(config.pollInterval, 0.1)
         return config
     }
 }
@@ -345,13 +484,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     /// Sync the panel with app state; call after any config/permission change.
-    func refresh(permissionLost: Bool, pollInterval: Double, blacklistCount: Int,
+    func refresh(permissionLost: Bool, blacklistCount: Int,
                  version: String, debugEnabled: Bool, launchAtLogin: Bool?) {
         statusLabel.stringValue = permissionLost ? "⚠️ 屏幕录制权限已失效" : "● 运行中"
         statusLabel.textColor = permissionLost ? .systemRed : .systemGreen
         // The recovery button only exists while recovery is needed
         permissionButton.isHidden = !permissionLost
-        infoLabel.stringValue = "间隔 \(pollInterval)s · 黑名单 \(blacklistCount) 项 · v\(version)"
+        infoLabel.stringValue = "事件驱动 · 黑名单 \(blacklistCount) 项 · v\(version)"
         debugSwitch.state = debugEnabled ? .on : .off
         if let launchAtLogin {
             loginSwitch.isEnabled = true
@@ -417,9 +556,11 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private let ownPID = getpid()
     private var config = Config.load()
     private var blacklistMatcher = BlacklistMatcher(entries: [])
-    private var timer: Timer?
-    private var burstTimer: Timer?
-    private var burstRemaining = 0
+    private let wsTap = WindowServerTap()
+    /// Slow self-heal only: catches missed WindowServer events, keeps the
+    /// permission watchdog alive at idle, re-syncs per-window subscriptions.
+    /// Never the detection path.
+    private var fallbackTimer: Timer?
     private var isChecking = false
     private var interventionCooldownUntil = Date.distantPast
     // Consecutive activation failures for one target (window ID, or 0 for the
@@ -459,7 +600,8 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         setupMenuBar()
         setupMainMenu()
         setupWorkspaceObservers()
-        startTimer()
+        setupWindowServerTap()
+        startFallbackTimer()
         watchConfig()
 
         // Window actions share the menu items' selectors so there is one
@@ -526,7 +668,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         }
         
         let menu = NSMenu()
-        statusMenuItem = NSMenuItem(title: "✅ 运行中 | 间隔: \(config.pollInterval)s", action: nil, keyEquivalent: "")
+        statusMenuItem = NSMenuItem(title: "✅ 运行中 | 事件驱动", action: nil, keyEquivalent: "")
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
         
@@ -577,7 +719,6 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         }
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
         mainWC.refresh(permissionLost: screenPermissionLost,
-                        pollInterval: config.pollInterval,
                         blacklistCount: config.blacklist.count,
                         version: version,
                         debugEnabled: config.debugLogging,
@@ -600,7 +741,6 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private func applyConfig() {
         config = Config.load()
         blacklistMatcher = BlacklistMatcher(entries: config.blacklist)
-        startTimer()
         applyDebugState()
         refreshMainStatus()
     }
@@ -675,31 +815,76 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
     private func updateStatusText() {
         statusMenuItem.title = screenPermissionLost
             ? "⚠️ 屏幕录制权限已失效，焦点切换停摆"
-            : "✅ 运行中 | 间隔: \(config.pollInterval)s | 黑名单: \(config.blacklist.count)项"
+            : "✅ 运行中 | 事件驱动 | 黑名单: \(config.blacklist.count)项"
     }
 
-    private func startTimer() {
-        timer?.invalidate()
-        timer = Timer(timeInterval: config.pollInterval, repeats: true) { [weak self] _ in
+    private func startFallbackTimer() {
+        fallbackTimer?.invalidate()
+        // Fast fallback cadence when the WindowServer tap is unavailable
+        let interval: TimeInterval = wsTap.isActive ? 5 : 0.2
+        fallbackTimer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             self?.tick()
         }
         // .common mode keeps the fallback timer alive during menu tracking / window dragging
-        RunLoop.main.add(timer!, forMode: .common)
+        RunLoop.main.add(fallbackTimer!, forMode: .common)
         updateStatusText()
     }
 
     // MARK: - Event-driven focus correction
-    /// Workspace events drive the real-time checks; the timer is only a fallback,
-    /// so the polling interval can stay low-frequency without visible latency.
+    /// WindowServer events (window create/destroy/order/focus, Space switches)
+    /// drive detection at the exact moment things change — no polling on the
+    /// hot path. NSWorkspace still covers what the WindowServer cannot see
+    /// (hide is an AppKit state) and acts as a redundant trigger.
     private func setupWorkspaceObservers() {
         let nc = NSWorkspace.shared.notificationCenter
         [NSWorkspace.didHideApplicationNotification,
          NSWorkspace.didDeactivateApplicationNotification,
          NSWorkspace.didTerminateApplicationNotification,
          NSWorkspace.didLaunchApplicationNotification,
-         NSWorkspace.didActivateApplicationNotification,
-         NSWorkspace.activeSpaceDidChangeNotification].forEach {
+         NSWorkspace.didActivateApplicationNotification].forEach {
             nc.addObserver(self, selector: #selector(handleWorkspaceEvent(_:)), name: $0, object: nil)
+        }
+    }
+
+    private func setupWindowServerTap() {
+        wsTap.onEvent = { [weak self] notification, wid in
+            self?.handleWindowServerEvent(notification, wid: wid)
+        }
+        wsTap.start()
+    }
+
+    private func handleWindowServerEvent(_ n: WSNotification, wid: CGWindowID) {
+        switch n {
+        case .windowCreated:
+            // Subscribe blind — the layer is unknown until the next snapshot;
+            // a non-layer-0 window's events are ignored by the anchor check.
+            wsTap.subscribe(wid)
+            tick()
+        case .windowDestroyed, .windowOrderedOut:
+            // Close (804) / minimize or order-out (816) of the tracked window:
+            // check immediately, then once more after the system's own focus
+            // fallback had time to land (or not).
+            if wid == topID {
+                tick()
+                schedulePostCooldownCheck(after: 0.25)
+            }
+        case .windowFocused:
+            // A fresh window focus is a deliberate choice (user click, cmd-tab,
+            // or our own intervention): stand down briefly, then re-check.
+            interventionCooldownUntil = Date().addingTimeInterval(0.2)
+            schedulePostCooldownCheck(after: 0.2)
+            tick()
+        case .windowOrderedIn:
+            // A window reappearing (un-minimize) can change the z-order candidate
+            tick()
+        case .spaceCurrentChanged, .activeSpaceChanged:
+            // Space-switch animation rewrites the on-screen window list
+            // wholesale while target windows have not landed yet; wait it out.
+            interventionCooldownUntil = Date().addingTimeInterval(0.5)
+            schedulePostCooldownCheck(after: 0.5)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.tick()
+            }
         }
     }
 
@@ -717,13 +902,7 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                 interventionCooldownUntil = Date().addingTimeInterval(0.2)
                 schedulePostCooldownCheck(after: 0.2)
             }
-            startBurst()
-        case NSWorkspace.activeSpaceDidChangeNotification:
-            // Space-switch animation rewrites the on-screen window list
-            // wholesale while target windows have not landed yet; wait it out.
-            interventionCooldownUntil = Date().addingTimeInterval(0.5)
-            schedulePostCooldownCheck(after: 0.5)
-            startBurst(initialDelay: 0.3)
+            tick()
         default:
             // App set changed: re-resolve bundle-id entries to fresh PIDs (a
             // relaunched blacklisted app gets a new PID; a stale one could be
@@ -736,7 +915,9 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
             // the system's own focus settling finish first. It can stay short
             // because the "accept the system's fallback" check prevents fighting.
             let delay: TimeInterval = note.name == NSWorkspace.didDeactivateApplicationNotification ? 0.05 : 0
-            startBurst(initialDelay: delay)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.tick()
+            }
         }
     }
 
@@ -749,30 +930,6 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// A single debounced check loses the race against close animations and
-    /// delayed app termination. Instead, on any workspace event we open an
-    /// 800ms high-frequency detection window (50ms x 16 ticks) that keeps
-    /// watching until the window list settles; event storms (rapid Cmd+W)
-    /// extend the window. Idle CPU cost stays at the fallback timer's level.
-    private func startBurst(initialDelay: TimeInterval = 0) {
-        burstRemaining = 16
-        guard burstTimer == nil else { return }
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] t in
-            guard let self = self else { t.invalidate(); return }
-            self.tick()
-            self.burstRemaining -= 1
-            if self.burstRemaining <= 0 {
-                t.invalidate()
-                self.burstTimer = nil
-            }
-        }
-        if initialDelay > 0 {
-            timer.fireDate = Date().addingTimeInterval(initialDelay)
-        }
-        burstTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
-    }
-    
     private func watchConfig() {
         configWatcher?.cancel()
         configWatcher = nil
@@ -858,6 +1015,9 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
                 }
 
                 guard let list = list else { return }
+                // Re-align the per-window subscription with reality; the
+                // snapshot is the only source of current layer-0 window ids.
+                wsTap.subscribe(layer0WindowIDs(in: list))
                 guard cur?.windowNumber != previousID else { return }
 
                 let nextID = cur?.windowNumber ?? 0
@@ -971,6 +1131,19 @@ class SmartFocusApp: NSObject, NSApplicationDelegate {
 
     private func snapshot() -> [[String: Any]]? {
         CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    }
+
+    /// Layer-0 (normal app window) ids from an on-screen snapshot — the set of
+    /// windows worth receiving per-window WindowServer events for.
+    private func layer0WindowIDs(in list: [[String: Any]]) -> Set<CGWindowID> {
+        var ids = Set<CGWindowID>()
+        for w in list {
+            if (w[kCGWindowLayer as String] as? Int) == 0,
+               let id = w[kCGWindowNumber as String] as? CGWindowID {
+                ids.insert(id)
+            }
+        }
+        return ids
     }
 
     private func contains(_ list: [[String: Any]], _ id: CGWindowID) -> Bool {
